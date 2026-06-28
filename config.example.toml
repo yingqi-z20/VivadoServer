@@ -1,0 +1,16 @@
+listen_addr = "127.0.0.1:8080"
+vivado_path = "vivado"
+workspace_root = "C:/vivado-workspaces"
+auth_tokens = ["change-me"]
+
+max_active_sessions = 1
+heartbeat_timeout_secs = 120
+output_buffer_bytes = 1048576
+
+sync_max_file_bytes = 1073741824
+sync_max_manifest_entries = 200000
+sync_session_ttl_secs = 3600
+
+# [tls]
+# cert_path = "server.crt"
+# key_path = "server.key"

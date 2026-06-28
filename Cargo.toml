@@ -1,0 +1,33 @@
+[package]
+name = "vivado-server"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+chrono = { version = "0.4", features = ["clock", "serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+filetime = "0.2"
+globset = "0.4"
+http-body-util = "0.1"
+portable-pty = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["io"] }
+toml = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["serde", "v4"] }
+walkdir = "2"
+
+[dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tempfile = "3"
