@@ -6,6 +6,9 @@ auth_tokens = ["change-me"]
 max_active_sessions = 1
 heartbeat_timeout_secs = 120
 output_buffer_bytes = 1048576
+api_json_body_limit_bytes = 67108864
+session_retention_secs = 3600
+stdin_max_bytes = 1048576
 
 sync_max_file_bytes = 1073741824
 sync_max_manifest_entries = 200000

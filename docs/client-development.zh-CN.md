@@ -65,7 +65,11 @@ Content-Type: application/json
 | 401 | 未认证或 token 无效 |
 | 404 | session、sync session 或文件不存在 |
 | 409 | 冲突，例如 commit 前服务器文件被改动、缺少上传文件、会话数量超限 |
+| 413 | JSON 请求超过 `api_json_body_limit_bytes` |
 | 500 | 服务端内部错误 |
+
+未知 `/v1/*` 路由和参数提取错误也使用同一种 JSON 格式；未知的版本化路由仍需
+认证。`500` 的主机路径和操作系统细节只写入服务端日志，不返回给客户端。
 
 ## 2. 项目名和路径规则
 
@@ -90,6 +94,8 @@ Content-Type: application/json
 - 非空。
 - 不能是 `.` 或 `..`。
 - 只允许 ASCII 字母、数字、`_`、`-`、`.`。
+- 最长 64 字节，不能以 `.` 结尾。
+- 不能是 `CON`、`NUL`、`COM1`、`LPT1` 等 Windows 设备名。
 
 合法示例：
 
@@ -149,6 +155,9 @@ a//b
 - 不能包含 `.` 或 `..` 段。
 - 不能包含 Windows drive prefix，例如 `C:`。
 - 不能访问 `.vivado-server-sync/`，这是服务端内部 staging 目录。
+- 路径段不能包含控制字符、以点/空格结尾、使用 Windows 设备名或超过 255 个
+  UTF-8 字节；完整路径上限为 4096 字节。
+- 不支持 symlink、junction 和其他 reparse point；已有祖先目录中的链接也会被拒绝。
 - URL 中的 `{path}` 是通配路径。普通 Vivado 工程路径通常可以直接拼到
   `/files/` 后面；如果路径段包含特殊字符，客户端应按 URL path segment
   做 percent-encoding。
@@ -157,6 +166,9 @@ a//b
 
 客户端需要扫描本地目录并生成 manifest。服务端也会扫描服务器 project
 目录生成 manifest。
+
+服务端会把 SHA-256 统一为小写，并为已接受的嵌套路径补齐缺失的父目录 entry。
+如果某个 file entry 是另一个 entry 的祖先，manifest 会被拒绝。
 
 ### 3.1 File Entry
 
@@ -334,8 +346,10 @@ Content-Type: application/json
 
 - `upload_files`：客户端必须上传的文件。
 - `create_dirs`：commit 时服务端会创建的目录。
-- `delete_files`：仅当请求 `delete_extra=true` 时，commit 会删除的服务器文件。
-- `delete_dirs`：仅当请求 `delete_extra=true` 时，commit 会删除的服务器目录。
+- `delete_files`：commit 将删除的服务器文件。额外文件只在 `delete_extra=true`
+  时出现；同路径 file/dir 类型冲突即使在 `false` 时也会出现。
+- `delete_dirs`：对应的目录删除。把非空目录替换成文件必须使用
+  `delete_extra=true`。
 - `expires_at`：sync session 过期时间。
 
 ### 5.2 上传文件
@@ -415,6 +429,13 @@ Content-Type: application/json
 - `force=false` 时，服务端检查 plan 时的服务器文件 SHA-256 是否仍然匹配。
 - 如果目标文件被其他进程或用户改动，返回 `409`。
 - `force=true` 跳过冲突检测，直接覆盖本轮 sync 涉及的目标文件。
+
+原子性与并发：
+
+- 同一 project 的 plan/commit 会串行执行，两个 commit 不会同时通过同一份 baseline。
+- commit 先把待覆盖或删除的路径移动到同文件系统的 rollback 区；后续任一步失败时，
+  已完成的修改会恢复，上传文件也会放回 staging，允许修正后重试。
+- 如果目录内存在未纳入 plan 的内容，服务端不会静默删除它，而是返回 `409` 并回滚。
 
 推荐客户端行为：
 
@@ -616,8 +637,9 @@ Content-Type: application/json
 }
 ```
 
-服务端会在 `workspace_root/<project>` 中启动 Vivado。`args` 会作为参数数组传给
-Vivado，不经过 shell 拼接。
+服务端会在 `workspace_root/<project>` 中启动 Vivado。Windows 下，未带扩展名的
+绝对 `vivado_path` 会自动解析到同目录的 `.bat` 包装器；包装器经 `cmd.exe` 启动，
+含 cmd 元字符的参数会被拒绝。复杂 Tcl 命令应通过 stdin 发送，而不是放在 `args` 中。
 
 ### 8.2 发送输入
 
@@ -636,6 +658,7 @@ Content-Type: application/json
 ```
 
 服务端会把 `text` 写入 Vivado 进程 stdin。客户端需要自己追加换行。
+当 UTF-8 `text` 超过 `stdin_max_bytes` 时请求会被拒绝。
 
 ### 8.3 轮询输出
 
@@ -677,6 +700,7 @@ Authorization: Bearer <token>
 ```
 
 客户端应定期发送 heartbeat。推荐间隔为 `heartbeat_timeout_secs / 3`。
+终态 session 的 heartbeat 返回 `409`。
 
 ### 8.5 查询和终止 Session
 
@@ -694,6 +718,9 @@ exited
 terminated
 failed
 ```
+
+终态响应包含 `ended_at`。session 会保留 `session_retention_secs` 供查询，随后由
+reaper 清理。
 
 `DELETE` 会先尝试向 Vivado 写入 `exit\n`，短暂等待后强制 kill。
 

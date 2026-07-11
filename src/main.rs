@@ -40,6 +40,9 @@ async fn main() -> anyhow::Result<()> {
         max_active_sessions = config.max_active_sessions,
         heartbeat_timeout_secs = config.heartbeat_timeout_secs,
         output_buffer_bytes = config.output_buffer_bytes,
+        api_json_body_limit_bytes = config.api_json_body_limit_bytes,
+        session_retention_secs = config.session_retention_secs,
+        stdin_max_bytes = config.stdin_max_bytes,
         sync_max_file_bytes = config.sync_max_file_bytes,
         sync_max_manifest_entries = config.sync_max_manifest_entries,
         sync_session_ttl_secs = config.sync_session_ttl_secs,
@@ -51,13 +54,19 @@ async fn main() -> anyhow::Result<()> {
         .listen_addr
         .parse()
         .with_context(|| format!("invalid listen_addr {}", config.listen_addr))?;
+    if !addr.ip().is_loopback() && config.tls.is_none() {
+        tracing::warn!(
+            %addr,
+            "listening on a non-loopback address without TLS; bearer tokens and project data are sent in cleartext"
+        );
+    }
 
     let manager = SessionManager::new(config.clone());
     manager.spawn_heartbeat_reaper();
-    let app = build_router(config.clone(), manager);
+    let app = build_router(config.clone(), manager.clone());
 
     tracing::info!(%addr, "starting vivado server");
-    if let Some(tls) = config.tls.as_ref() {
+    let server_result = if let Some(tls) = config.tls.as_ref() {
         tracing::debug!(
             cert_path = %tls.cert_path.display(),
             key_path = %tls.key_path.display(),
@@ -77,7 +86,7 @@ async fn main() -> anyhow::Result<()> {
             .handle(handle)
             .serve(app.into_make_service())
             .await
-            .context("server error")?;
+            .context("server error")
     } else {
         tracing::debug!("starting without TLS");
         let listener = tokio::net::TcpListener::bind(addr)
@@ -86,8 +95,11 @@ async fn main() -> anyhow::Result<()> {
         axum::serve(listener, app)
             .with_graceful_shutdown(shutdown_signal())
             .await
-            .context("server error")?;
-    }
+            .context("server error")
+    };
+
+    manager.shutdown().await;
+    server_result?;
 
     Ok(())
 }

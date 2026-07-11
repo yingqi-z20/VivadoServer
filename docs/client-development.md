@@ -61,7 +61,12 @@ Common status codes:
 | 401 | Missing or invalid Bearer token |
 | 404 | Session, sync session, or file not found |
 | 409 | Conflict, session limit reached, missing upload, commit conflict |
+| 413 | JSON request exceeds `api_json_body_limit_bytes` |
 | 500 | Server-side failure |
+
+Unknown `/v1/*` routes and extractor failures use the same JSON error shape.
+Unknown versioned routes still require authentication. Internal OS/path details
+are logged server-side and are not returned in a `500` body.
 
 ## 2. Naming And Path Rules
 
@@ -79,6 +84,8 @@ Valid project names:
 - non-empty
 - not `.` or `..`
 - ASCII letters, digits, `_`, `-`, `.`
+- at most 64 bytes, with no trailing dot
+- not a Windows device name such as `CON`, `NUL`, `COM1`, or `LPT1`
 
 Invalid examples:
 
@@ -131,6 +138,10 @@ Rules:
 - Do not send backslashes.
 - Do not send Windows drive prefixes.
 - The server-reserved `.vivado-server-sync/` directory is always rejected.
+- Segments may not end in a dot/space, contain control characters, use Windows
+  device names, or exceed 255 UTF-8 bytes. The full path limit is 4096 bytes.
+- Symlinks, junctions, and other reparse points are rejected, including in
+  existing ancestor directories.
 - URL paths should be percent-encoded per segment when needed. In normal
   Vivado project paths using letters, digits, `_`, `-`, `.`, and `/`, no extra
   encoding is usually needed.
@@ -138,6 +149,9 @@ Rules:
 ## 3. Manifest Model
 
 The client computes a local manifest and sends it to plan push or pull syncs.
+The server normalizes SHA-256 to lowercase and synthesizes missing directory
+entries for accepted nested paths. A manifest is rejected if a file is an
+ancestor of another entry.
 
 ### Manifest Entry
 
@@ -388,10 +402,11 @@ Response semantics:
 
 - `upload_files`: files the client must upload before commit.
 - `create_dirs`: directories the server will create during commit.
-- `delete_files`: server files that commit will delete only when
-  `delete_extra=true`.
-- `delete_dirs`: server directories that commit will delete only when
-  `delete_extra=true`.
+- `delete_files`: server files commit will delete. Extra files appear only with
+  `delete_extra=true`; a same-path file/directory type conflict appears even
+  when `delete_extra=false`.
+- `delete_dirs`: analogous directory deletions. Replacing a non-empty directory
+  with a file requires `delete_extra=true`.
 - `expires_at`: time after which the server may remove the staging session.
 
 ### 6.3 Upload Push File
@@ -473,6 +488,16 @@ Conflict behavior:
 Missing upload behavior:
 
 - If any planned upload was not uploaded, commit returns `409`.
+
+Atomicity and concurrency:
+
+- Planning and commit are serialized per project, so two commits cannot both
+  pass the same baseline concurrently.
+- Commit first moves replaced/deleted paths to a same-filesystem rollback area.
+  If a later operation fails, earlier mutations are restored and uploads are
+  returned to staging for retry.
+- Directories containing entries excluded from the plan are not silently
+  deleted; commit returns `409` and rolls back.
 
 Recommended client behavior:
 
@@ -616,6 +641,11 @@ Response:
 
 The server starts Vivado in `workspace_root/<project>`.
 
+On Windows, an extensionless absolute `vivado_path` resolves to its adjacent
+`.bat` wrapper when available. The wrapper is launched through `cmd.exe`, and
+arguments containing cmd metacharacters are rejected. Clients should pass
+complex Tcl commands over stdin rather than command-line arguments.
+
 ### 7.2 Send Stdin
 
 ```http
@@ -633,6 +663,7 @@ Request:
 ```
 
 The server writes `text` to the Vivado process stdin.
+The JSON request is rejected when UTF-8 `text` exceeds `stdin_max_bytes`.
 
 ### 7.3 Read Output
 
@@ -675,6 +706,7 @@ Authorization: Bearer <token>
 
 The client should call heartbeat before `heartbeat_timeout_secs` expires. A
 reasonable interval is one third of the configured timeout.
+Heartbeat on a terminal session returns `409`.
 
 ### 7.5 Get Or Delete Session
 
@@ -692,6 +724,9 @@ exited
 terminated
 failed
 ```
+
+`ended_at` is present for terminal sessions. They remain queryable for
+`session_retention_secs` before the reaper removes them.
 
 `DELETE` asks Vivado to exit and then force-kills it after a short grace period.
 

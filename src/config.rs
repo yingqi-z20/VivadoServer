@@ -18,6 +18,18 @@ fn default_output_buffer_bytes() -> usize {
     1024 * 1024
 }
 
+fn default_api_json_body_limit_bytes() -> usize {
+    64 * 1024 * 1024
+}
+
+fn default_session_retention_secs() -> u64 {
+    3_600
+}
+
+fn default_stdin_max_bytes() -> usize {
+    1024 * 1024
+}
+
 fn default_sync_max_file_bytes() -> u64 {
     1024 * 1024 * 1024
 }
@@ -44,6 +56,16 @@ pub struct AppConfig {
     pub heartbeat_timeout_secs: u64,
     #[serde(default = "default_output_buffer_bytes")]
     pub output_buffer_bytes: usize,
+    /// Maximum decoded request-body size for JSON API calls.
+    ///
+    /// Axum otherwise defaults JSON bodies to 2 MiB, which is too small for
+    /// the configured 200,000-entry sync manifests.
+    #[serde(default = "default_api_json_body_limit_bytes")]
+    pub api_json_body_limit_bytes: usize,
+    #[serde(default = "default_session_retention_secs")]
+    pub session_retention_secs: u64,
+    #[serde(default = "default_stdin_max_bytes")]
+    pub stdin_max_bytes: usize,
     #[serde(default = "default_sync_max_file_bytes")]
     pub sync_max_file_bytes: u64,
     #[serde(default = "default_sync_max_manifest_entries")]
@@ -65,14 +87,42 @@ impl AppConfig {
         let path = path.into();
         let body = fs::read_to_string(&path)?;
         let mut config: AppConfig = toml::from_str(&body)?;
+        #[cfg(windows)]
+        if config.vivado_path.extension().is_none() {
+            let batch_wrapper = config.vivado_path.with_extension("bat");
+            if batch_wrapper.is_file() {
+                config.vivado_path = batch_wrapper;
+            }
+        }
+        if config.auth_tokens.is_empty() {
+            anyhow::bail!("auth_tokens must contain at least one token");
+        }
         if config.auth_tokens.iter().any(|token| token.is_empty()) {
             anyhow::bail!("auth_tokens must not contain empty tokens");
+        }
+        if config.vivado_path.is_absolute() && !config.vivado_path.is_file() {
+            anyhow::bail!(
+                "vivado_path does not exist or is not a file: {}",
+                config.vivado_path.display()
+            );
         }
         if config.max_active_sessions == 0 {
             anyhow::bail!("max_active_sessions must be at least 1");
         }
+        if config.heartbeat_timeout_secs == 0 {
+            anyhow::bail!("heartbeat_timeout_secs must be at least 1");
+        }
         if config.output_buffer_bytes == 0 {
             anyhow::bail!("output_buffer_bytes must be at least 1");
+        }
+        if config.api_json_body_limit_bytes == 0 {
+            anyhow::bail!("api_json_body_limit_bytes must be at least 1");
+        }
+        if config.session_retention_secs == 0 {
+            anyhow::bail!("session_retention_secs must be at least 1");
+        }
+        if config.stdin_max_bytes == 0 {
+            anyhow::bail!("stdin_max_bytes must be at least 1");
         }
         if config.sync_max_file_bytes == 0 {
             anyhow::bail!("sync_max_file_bytes must be at least 1");
@@ -99,6 +149,10 @@ impl AppConfig {
     pub fn sync_session_ttl(&self) -> Duration {
         Duration::from_secs(self.sync_session_ttl_secs)
     }
+
+    pub fn session_retention(&self) -> Duration {
+        Duration::from_secs(self.session_retention_secs)
+    }
 }
 
 #[cfg(test)]
@@ -120,6 +174,9 @@ auth_tokens = ["token"]
         assert_eq!(parsed.max_active_sessions, 1);
         assert_eq!(parsed.heartbeat_timeout_secs, 120);
         assert_eq!(parsed.output_buffer_bytes, 1024 * 1024);
+        assert_eq!(parsed.api_json_body_limit_bytes, 64 * 1024 * 1024);
+        assert_eq!(parsed.session_retention_secs, 3_600);
+        assert_eq!(parsed.stdin_max_bytes, 1024 * 1024);
         assert_eq!(parsed.sync_max_file_bytes, 1024 * 1024 * 1024);
         assert_eq!(parsed.sync_max_manifest_entries, 200_000);
         assert_eq!(parsed.sync_session_ttl_secs, 3_600);

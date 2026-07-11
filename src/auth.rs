@@ -6,6 +6,7 @@ use axum::{
     response::Response,
 };
 use std::sync::Arc;
+use subtle::ConstantTimeEq;
 
 #[derive(Clone)]
 pub struct AuthState {
@@ -20,7 +21,11 @@ impl AuthState {
     }
 
     fn is_allowed(&self, candidate: &str) -> bool {
-        !self.tokens.is_empty() && self.tokens.iter().any(|token| token == candidate)
+        !self.tokens.is_empty()
+            && self
+                .tokens
+                .iter()
+                .any(|token| bool::from(token.as_bytes().ct_eq(candidate.as_bytes())))
     }
 }
 
@@ -44,6 +49,11 @@ pub async fn require_auth(
         tracing::debug!("authorization failed: unsupported authorization scheme");
         return Err(AppError::Unauthorized);
     };
+
+    if token.is_empty() {
+        tracing::debug!("authorization failed: empty bearer token");
+        return Err(AppError::Unauthorized);
+    }
 
     if !auth.is_allowed(token) {
         tracing::debug!("authorization failed: bearer token mismatch");

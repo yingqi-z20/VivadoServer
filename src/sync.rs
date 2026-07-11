@@ -1,4 +1,8 @@
-use crate::{AppConfig, error::AppError, paths::resolve_project_dir};
+use crate::{
+    AppConfig,
+    error::AppError,
+    paths::{resolve_project_dir, validate_portable_segment},
+};
 use axum::{
     body::Body,
     http::{
@@ -15,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
-    fs::File,
+    fs::{File, Metadata},
     io::{BufReader, Read},
     path::{Component, Path, PathBuf},
     sync::Arc,
@@ -173,10 +177,12 @@ pub struct AbortSyncResponse {
 pub struct SyncManager {
     config: Arc<AppConfig>,
     sessions: Arc<RwLock<HashMap<Uuid, Arc<AsyncMutex<PushSession>>>>>,
+    project_locks: Arc<RwLock<HashMap<String, Arc<AsyncMutex<()>>>>>,
 }
 
 #[derive(Debug)]
 struct PushSession {
+    state: PushSessionState,
     project: String,
     project_dir: PathBuf,
     staging_dir: PathBuf,
@@ -188,6 +194,22 @@ struct PushSession {
     delete_dirs: Vec<String>,
     baseline: HashMap<String, ManifestEntry>,
     delete_extra: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PushSessionState {
+    Open,
+    Committed,
+    Aborted,
+    Expired,
+}
+
+fn ensure_push_session_open(session: &PushSession) -> Result<(), AppError> {
+    if session.state == PushSessionState::Open {
+        Ok(())
+    } else {
+        Err(AppError::NotFound("sync session is closed".to_string()))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -203,6 +225,241 @@ struct SyncFilters {
     exclude: GlobSet,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum CreatedPathKind {
+    Dir,
+}
+
+#[derive(Debug)]
+enum AppliedChange {
+    Created {
+        target: PathBuf,
+        kind: CreatedPathKind,
+    },
+    Replaced {
+        target: PathBuf,
+        backup: PathBuf,
+    },
+    Installed {
+        target: PathBuf,
+        staged: PathBuf,
+        backup: Option<PathBuf>,
+    },
+}
+
+struct CommitTransaction {
+    backup_root: PathBuf,
+    changes: Vec<AppliedChange>,
+}
+
+impl CommitTransaction {
+    async fn new(backup_root: PathBuf) -> Result<Self, AppError> {
+        tokio::fs::create_dir_all(&backup_root)
+            .await
+            .map_err(|err| AppError::Internal(format!("failed to create rollback dir: {err}")))?;
+        Ok(Self {
+            backup_root,
+            changes: Vec::new(),
+        })
+    }
+
+    async fn create_dir(&mut self, target: PathBuf, path: &str) -> Result<(), AppError> {
+        match tokio::fs::symlink_metadata(&target).await {
+            Ok(metadata) if metadata.is_dir() && !metadata_is_link(&metadata) => return Ok(()),
+            Ok(_) => {
+                return Err(AppError::Conflict(format!(
+                    "target is not a directory: {path}"
+                )));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(AppError::Internal(format!(
+                    "failed to inspect directory target: {err}"
+                )));
+            }
+        }
+        tokio::fs::create_dir(&target)
+            .await
+            .map_err(|err| AppError::Internal(format!("failed to create dir {path}: {err}")))?;
+        self.changes.push(AppliedChange::Created {
+            target,
+            kind: CreatedPathKind::Dir,
+        });
+        Ok(())
+    }
+
+    async fn install_file(
+        &mut self,
+        staged: PathBuf,
+        target: PathBuf,
+        path: &str,
+    ) -> Result<(), AppError> {
+        let backup = match tokio::fs::symlink_metadata(&target).await {
+            Ok(metadata) if metadata.is_file() && !metadata_is_link(&metadata) => {
+                Some(self.backup(&target).await?)
+            }
+            Ok(_) => {
+                return Err(AppError::Conflict(format!(
+                    "target is not a regular file: {path}"
+                )));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => {
+                return Err(AppError::Internal(format!(
+                    "failed to inspect file target: {err}"
+                )));
+            }
+        };
+
+        // Once the old target has moved, record it before attempting the
+        // install. If the staged rename fails, the outer rollback still knows
+        // exactly where the original file lives.
+        if let Some(backup) = &backup {
+            self.changes.push(AppliedChange::Replaced {
+                target: target.clone(),
+                backup: backup.clone(),
+            });
+        }
+        if let Err(err) = tokio::fs::rename(&staged, &target).await {
+            return Err(AppError::Internal(format!(
+                "failed to commit staged file {path}: {err}"
+            )));
+        }
+        if backup.is_some() {
+            let replaced = self.changes.pop();
+            debug_assert!(matches!(replaced, Some(AppliedChange::Replaced { .. })));
+        }
+        self.changes.push(AppliedChange::Installed {
+            target,
+            staged,
+            backup,
+        });
+        Ok(())
+    }
+
+    async fn delete_file(&mut self, target: PathBuf, path: &str) -> Result<bool, AppError> {
+        match tokio::fs::symlink_metadata(&target).await {
+            Ok(metadata) if metadata.is_file() && !metadata_is_link(&metadata) => {
+                let backup = self.backup(&target).await?;
+                self.changes
+                    .push(AppliedChange::Replaced { target, backup });
+                Ok(true)
+            }
+            Ok(_) => Err(AppError::Conflict(format!(
+                "file target changed type during commit: {path}"
+            ))),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(err) => Err(AppError::Internal(format!(
+                "failed to inspect file for deletion: {err}"
+            ))),
+        }
+    }
+
+    async fn delete_empty_dir(&mut self, target: PathBuf, path: &str) -> Result<bool, AppError> {
+        let metadata = match tokio::fs::symlink_metadata(&target).await {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(err) => {
+                return Err(AppError::Internal(format!(
+                    "failed to inspect directory for deletion: {err}"
+                )));
+            }
+        };
+        if !metadata.is_dir() || metadata_is_link(&metadata) {
+            return Err(AppError::Conflict(format!(
+                "directory target changed type during commit: {path}"
+            )));
+        }
+        let mut entries = tokio::fs::read_dir(&target)
+            .await
+            .map_err(|err| AppError::Internal(format!("failed to read dir {path}: {err}")))?;
+        if entries
+            .next_entry()
+            .await
+            .map_err(|err| AppError::Internal(format!("failed to read dir {path}: {err}")))?
+            .is_some()
+        {
+            return Err(AppError::Conflict(format!(
+                "directory contains entries outside the sync plan: {path}"
+            )));
+        }
+        let backup = self.backup(&target).await?;
+        self.changes
+            .push(AppliedChange::Replaced { target, backup });
+        Ok(true)
+    }
+
+    async fn backup(&self, target: &Path) -> Result<PathBuf, AppError> {
+        let backup = self.backup_root.join(Uuid::new_v4().to_string());
+        tokio::fs::rename(target, &backup)
+            .await
+            .map_err(|err| AppError::Internal(format!("failed to stage rollback backup: {err}")))?;
+        Ok(backup)
+    }
+
+    async fn rollback(&mut self) -> Result<(), AppError> {
+        while let Some(change) = self.changes.pop() {
+            match change {
+                AppliedChange::Created { target, kind } => {
+                    remove_created_path(&target, kind).await?;
+                }
+                AppliedChange::Replaced { target, backup } => {
+                    remove_replacement_target(&target).await?;
+                    tokio::fs::rename(&backup, &target).await.map_err(|err| {
+                        AppError::Internal(format!("failed to restore rollback backup: {err}"))
+                    })?;
+                }
+                AppliedChange::Installed {
+                    target,
+                    staged,
+                    backup,
+                } => {
+                    tokio::fs::rename(&target, &staged).await.map_err(|err| {
+                        AppError::Internal(format!("failed to restore staged upload: {err}"))
+                    })?;
+                    if let Some(backup) = backup {
+                        tokio::fs::rename(&backup, &target).await.map_err(|err| {
+                            AppError::Internal(format!("failed to restore replaced file: {err}"))
+                        })?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+async fn remove_created_path(path: &Path, kind: CreatedPathKind) -> Result<(), AppError> {
+    let result = match kind {
+        CreatedPathKind::Dir => tokio::fs::remove_dir(path).await,
+    };
+    match result {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(AppError::Internal(format!(
+            "failed to remove created path during rollback: {err}"
+        ))),
+    }
+}
+
+async fn remove_replacement_target(path: &Path) -> Result<(), AppError> {
+    let metadata = match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(AppError::Internal(format!(
+                "failed to inspect rollback target: {err}"
+            )));
+        }
+    };
+    let result = if metadata.is_dir() && !metadata_is_link(&metadata) {
+        tokio::fs::remove_dir(path).await
+    } else {
+        tokio::fs::remove_file(path).await
+    };
+    result.map_err(|err| AppError::Internal(format!("failed to clear rollback target: {err}")))
+}
+
 impl SyncManager {
     pub fn new(config: AppConfig) -> Self {
         tracing::debug!(
@@ -215,6 +472,7 @@ impl SyncManager {
         Self {
             config: Arc::new(config),
             sessions: Arc::new(RwLock::new(HashMap::new())),
+            project_locks: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -246,6 +504,8 @@ impl SyncManager {
             "sync manifest requested"
         );
         let filters = SyncFilters::new(&request.include_globs, &request.exclude_globs)?;
+        let project_lock = self.project_lock(&project).await?;
+        let _project_guard = project_lock.lock().await;
         let project_dir = self.project_dir(&project).await?;
         let response = self.scan_manifest(project_dir, filters).await?;
         let stats = manifest_stats(&response.entries);
@@ -282,6 +542,8 @@ impl SyncManager {
             "sync push plan requested"
         );
         let filters = SyncFilters::new(&include_globs, &exclude_globs)?;
+        let project_lock = self.project_lock(&project).await?;
+        let _project_guard = project_lock.lock().await;
         let project_dir = self.project_dir(&project).await?;
         let server_manifest = self
             .scan_manifest(project_dir.clone(), filters.clone())
@@ -326,10 +588,9 @@ impl SyncManager {
                     {
                         create_dirs.push(entry.path.clone());
                     }
-                    if delete_extra
-                        && server.get(&entry.path).is_some_and(|server_entry| {
-                            server_entry.kind == ManifestEntryKind::File
-                        })
+                    if server
+                        .get(&entry.path)
+                        .is_some_and(|server_entry| server_entry.kind == ManifestEntryKind::File)
                     {
                         delete_files.push(entry.path.clone());
                     }
@@ -349,11 +610,17 @@ impl SyncManager {
                             },
                         );
                     }
-                    if delete_extra
-                        && server
-                            .get(&entry.path)
-                            .is_some_and(|server_entry| server_entry.kind == ManifestEntryKind::Dir)
+                    if server
+                        .get(&entry.path)
+                        .is_some_and(|server_entry| server_entry.kind == ManifestEntryKind::Dir)
                     {
+                        let prefix = format!("{}/", entry.path);
+                        if !delete_extra && server.keys().any(|path| path.starts_with(&prefix)) {
+                            return Err(AppError::Conflict(format!(
+                                "replacing non-empty directory with file requires delete_extra=true: {}",
+                                entry.path
+                            )));
+                        }
                         delete_dirs.push(entry.path.clone());
                     }
                 }
@@ -378,10 +645,7 @@ impl SyncManager {
         let upload_bytes: u64 = upload_files.iter().map(|file| file.size_bytes).sum();
 
         let sync_id = Uuid::new_v4();
-        let staging_dir = self.staging_dir(&project_dir, sync_id);
-        tokio::fs::create_dir_all(staging_dir.join("files"))
-            .await
-            .map_err(|err| AppError::Internal(format!("failed to create staging dir: {err}")))?;
+        let staging_dir = create_staging_dir(&project_dir, sync_id).await?;
         tracing::debug!(
             project = %project,
             sync_id = %sync_id,
@@ -393,6 +657,7 @@ impl SyncManager {
             + chrono::Duration::from_std(self.config.sync_session_ttl())
                 .map_err(|err| AppError::Internal(format!("invalid sync ttl: {err}")))?;
         let session = PushSession {
+            state: PushSessionState::Open,
             project,
             project_dir,
             staging_dir,
@@ -463,6 +728,8 @@ impl SyncManager {
             "sync pull plan requested"
         );
         let filters = SyncFilters::new(&include_globs, &exclude_globs)?;
+        let project_lock = self.project_lock(&project).await?;
+        let _project_guard = project_lock.lock().await;
         let project_dir = self.project_dir(&project).await?;
         let server_manifest = self.scan_manifest(project_dir, filters.clone()).await?;
         let server_stats = manifest_stats(&server_manifest.entries);
@@ -504,10 +771,9 @@ impl SyncManager {
                     {
                         create_dirs.push(entry.path.clone());
                     }
-                    if delete_extra
-                        && client.get(&entry.path).is_some_and(|client_entry| {
-                            client_entry.kind == ManifestEntryKind::File
-                        })
+                    if client
+                        .get(&entry.path)
+                        .is_some_and(|client_entry| client_entry.kind == ManifestEntryKind::File)
                     {
                         delete_files.push(entry.path.clone());
                     }
@@ -519,10 +785,9 @@ impl SyncManager {
                     {
                         download_files.push(file_transfer(entry)?);
                     }
-                    if delete_extra
-                        && client
-                            .get(&entry.path)
-                            .is_some_and(|client_entry| client_entry.kind == ManifestEntryKind::Dir)
+                    if client
+                        .get(&entry.path)
+                        .is_some_and(|client_entry| client_entry.kind == ManifestEntryKind::Dir)
                     {
                         delete_dirs.push(entry.path.clone());
                     }
@@ -592,8 +857,9 @@ impl SyncManager {
         );
         let path = normalize_sync_path(&raw_path)?;
         let session = self.session(sync_id).await?;
+        let mut session = session.lock().await;
+        ensure_push_session_open(&session)?;
         let (expected, target_path, tmp_dir) = {
-            let session = session.lock().await;
             if session.project != project {
                 tracing::debug!(
                     project = %project,
@@ -620,6 +886,7 @@ impl SyncManager {
                 session.staging_dir.join("tmp"),
             )
         };
+        ensure_path_has_no_links(session.staging_dir.clone(), format!("files/{path}")).await?;
         tracing::debug!(
             project = %project,
             sync_id = %sync_id,
@@ -662,11 +929,28 @@ impl SyncManager {
             return Err(err);
         }
 
+        match tokio::fs::symlink_metadata(&target_path).await {
+            Ok(metadata) if metadata.is_file() => {
+                tokio::fs::remove_file(&target_path).await.map_err(|err| {
+                    AppError::Internal(format!("failed to replace staged upload: {err}"))
+                })?;
+            }
+            Ok(_) => {
+                return Err(AppError::Conflict(
+                    "staged upload target is not a regular file".to_string(),
+                ));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(AppError::Internal(format!(
+                    "failed to inspect staged upload: {err}"
+                )));
+            }
+        }
         tokio::fs::rename(&tmp_path, &target_path)
             .await
             .map_err(|err| AppError::Internal(format!("failed to move staged upload: {err}")))?;
 
-        let mut session = session.lock().await;
         session.uploaded_files.insert(path.clone());
         let uploaded_files = session.uploaded_files.len();
         tracing::debug!(
@@ -702,7 +986,8 @@ impl SyncManager {
             "sync commit requested"
         );
         let session = self.session(sync_id).await?;
-        let session = session.lock().await;
+        let mut session = session.lock().await;
+        ensure_push_session_open(&session)?;
         if session.project != project {
             tracing::debug!(
                 project = %project,
@@ -712,6 +997,13 @@ impl SyncManager {
             );
             return Err(AppError::NotFound("sync session not found".to_string()));
         }
+        let project_lock = self.project_lock(&project).await?;
+        let _project_guard = project_lock.lock().await;
+        ensure_safe_project_root(
+            self.config.workspace_root.clone(),
+            session.project_dir.clone(),
+        )
+        .await?;
         let missing: Vec<String> = session
             .upload_files
             .keys()
@@ -772,155 +1064,108 @@ impl SyncManager {
             )
             .await?;
         }
-        if session.delete_extra {
-            for path in session
-                .delete_files
-                .iter()
-                .chain(session.delete_dirs.iter())
-            {
-                tracing::trace!(
-                    project = %project,
-                    sync_id = %sync_id,
-                    path = %path,
-                    "checking delete baseline"
-                );
-                ensure_baseline_matches(
-                    &resolve_relative_path(&session.project_dir, path)?,
-                    session.baseline.get(path),
-                    request.force,
-                )
-                .await?;
-            }
-        }
-
-        for dir in &session.create_dirs {
-            let target = resolve_relative_path(&session.project_dir, dir)?;
-            if target.is_file() {
-                if request.force {
-                    tracing::debug!(
-                        project = %project,
-                        sync_id = %sync_id,
-                        path = %dir,
-                        target = %target.display(),
-                        "removing file before creating directory"
-                    );
-                    tokio::fs::remove_file(&target).await.map_err(|err| {
-                        AppError::Internal(format!(
-                            "failed to remove file before dir create: {err}"
-                        ))
-                    })?;
-                } else {
-                    return Err(AppError::Conflict(format!("target is a file: {dir}")));
-                }
-            }
-            tracing::debug!(
+        for path in session
+            .delete_files
+            .iter()
+            .chain(session.delete_dirs.iter())
+        {
+            tracing::trace!(
                 project = %project,
                 sync_id = %sync_id,
-                path = %dir,
-                target = %target.display(),
-                "creating synced directory"
+                path = %path,
+                "checking delete baseline"
             );
-            tokio::fs::create_dir_all(&target)
-                .await
-                .map_err(|err| AppError::Internal(format!("failed to create dir {dir}: {err}")))?;
-        }
-
-        for upload in session.upload_files.values() {
-            let target = resolve_relative_path(&session.project_dir, &upload.entry.path)?;
-            let staged =
-                resolve_relative_path(&session.staging_dir.join("files"), &upload.entry.path)?;
-            tracing::debug!(
-                project = %project,
-                sync_id = %sync_id,
-                path = %upload.entry.path,
-                size_bytes = upload.transfer.size_bytes,
-                sha256 = %upload.transfer.sha256,
-                staged = %staged.display(),
-                target = %target.display(),
-                "committing staged sync file"
-            );
-            tokio::fs::create_dir_all(
-                target
-                    .parent()
-                    .ok_or_else(|| AppError::BadRequest("invalid target path".to_string()))?,
+            ensure_baseline_matches(
+                &resolve_relative_path(&session.project_dir, path)?,
+                session.baseline.get(path),
+                request.force,
             )
-            .await
-            .map_err(|err| AppError::Internal(format!("failed to create target parent: {err}")))?;
-            if target.is_dir() {
-                return Err(AppError::Conflict(format!(
-                    "target is a directory: {}",
-                    upload.entry.path
-                )));
-            }
-            if target.is_file() {
-                tracing::trace!(
-                    project = %project,
-                    sync_id = %sync_id,
-                    path = %upload.entry.path,
-                    target = %target.display(),
-                    "removing existing target file before replace"
-                );
-                tokio::fs::remove_file(&target).await.map_err(|err| {
-                    AppError::Internal(format!("failed to replace target file: {err}"))
-                })?;
-            }
-            tokio::fs::rename(&staged, &target).await.map_err(|err| {
-                AppError::Internal(format!("failed to commit staged file: {err}"))
-            })?;
-            if let Some(mtime) = upload.entry.mtime_unix_ms {
-                tracing::trace!(
-                    project = %project,
-                    sync_id = %sync_id,
-                    path = %upload.entry.path,
-                    mtime_unix_ms = mtime,
-                    "restoring synced file mtime"
-                );
-                set_file_mtime(target, mtime).await?;
-            }
+            .await?;
         }
 
-        let mut deleted_files = Vec::new();
-        let mut deleted_dirs = Vec::new();
-        if session.delete_extra {
+        for path in session
+            .create_dirs
+            .iter()
+            .chain(session.upload_files.keys())
+            .chain(session.delete_files.iter())
+            .chain(session.delete_dirs.iter())
+        {
+            ensure_path_has_no_links(session.project_dir.clone(), path.clone()).await?;
+        }
+        for path in session.upload_files.keys() {
+            ensure_path_has_no_links(session.staging_dir.clone(), format!("files/{path}")).await?;
+        }
+
+        let mut transaction = CommitTransaction::new(session.staging_dir.join("rollback")).await?;
+        let apply_result: Result<(Vec<String>, Vec<String>), AppError> = async {
+            let mut deleted_files = Vec::new();
+            let mut deleted_dirs = Vec::new();
+
+            // Type replacements are represented as delete + create/install.
+            // Backups remain in staging until every operation has succeeded.
             for path in &session.delete_files {
                 let target = resolve_relative_path(&session.project_dir, path)?;
-                if target.is_file() {
-                    tracing::debug!(
-                        project = %project,
-                        sync_id = %sync_id,
-                        path = %path,
-                        target = %target.display(),
-                        "deleting extra synced file"
-                    );
-                    tokio::fs::remove_file(&target).await.map_err(|err| {
-                        AppError::Internal(format!("failed to delete file: {err}"))
-                    })?;
+                if transaction.delete_file(target, path).await? {
                     deleted_files.push(path.clone());
                 }
             }
             for path in &session.delete_dirs {
                 let target = resolve_relative_path(&session.project_dir, path)?;
-                if target.is_dir() {
-                    tracing::debug!(
-                        project = %project,
-                        sync_id = %sync_id,
-                        path = %path,
-                        target = %target.display(),
-                        "deleting extra synced directory"
-                    );
-                    tokio::fs::remove_dir(&target).await.map_err(|err| {
-                        AppError::Conflict(format!("failed to delete dir {path}: {err}"))
-                    })?;
+                if transaction.delete_empty_dir(target, path).await? {
                     deleted_dirs.push(path.clone());
                 }
             }
+
+            for dir in &session.create_dirs {
+                let target = resolve_relative_path(&session.project_dir, dir)?;
+                transaction.create_dir(target, dir).await?;
+            }
+
+            for upload in session.upload_files.values() {
+                let target = resolve_relative_path(&session.project_dir, &upload.entry.path)?;
+                let staged =
+                    resolve_relative_path(&session.staging_dir.join("files"), &upload.entry.path)?;
+                tracing::debug!(
+                    project = %project,
+                    sync_id = %sync_id,
+                    path = %upload.entry.path,
+                    size_bytes = upload.transfer.size_bytes,
+                    sha256 = %upload.transfer.sha256,
+                    "committing staged sync file"
+                );
+                transaction
+                    .install_file(staged, target.clone(), &upload.entry.path)
+                    .await?;
+                if let Some(mtime) = upload.entry.mtime_unix_ms {
+                    set_file_mtime(target, mtime).await?;
+                }
+            }
+
+            Ok((deleted_files, deleted_dirs))
         }
+        .await;
+
+        let (deleted_files, deleted_dirs) = match apply_result {
+            Ok(result) => result,
+            Err(apply_error) => {
+                if let Err(rollback_error) = transaction.rollback().await {
+                    return Err(AppError::Internal(format!(
+                        "sync commit failed ({apply_error}); rollback also failed ({rollback_error})"
+                    )));
+                }
+                return Err(apply_error);
+            }
+        };
 
         let created_dirs = session.create_dirs.clone();
         let uploaded_files: Vec<String> = session.upload_files.keys().cloned().collect();
         let staging_dir = session.staging_dir.clone();
-        drop(session);
+        session.state = PushSessionState::Committed;
+        // Remove the map entry while the per-session guard is still held. Any
+        // request that cloned the Arc before removal will observe Committed
+        // when it eventually acquires this guard.
         self.sessions.write().await.remove(&sync_id);
+        drop(session);
         let _ = tokio::fs::remove_dir_all(staging_dir).await;
         tracing::info!(
             project = %project,
@@ -954,26 +1199,20 @@ impl SyncManager {
             "sync abort requested"
         );
         let session = self.session(sync_id).await?;
-        {
-            let session = session.lock().await;
-            if session.project != project {
-                tracing::debug!(
-                    project = %project,
-                    sync_id = %sync_id,
-                    session_project = %session.project,
-                    "sync abort rejected because project does not match session"
-                );
-                return Err(AppError::NotFound("sync session not found".to_string()));
-            }
+        let mut session = session.lock().await;
+        ensure_push_session_open(&session)?;
+        if session.project != project {
+            tracing::debug!(
+                project = %project,
+                sync_id = %sync_id,
+                session_project = %session.project,
+                "sync abort rejected because project does not match session"
+            );
+            return Err(AppError::NotFound("sync session not found".to_string()));
         }
-        let session = self
-            .sessions
-            .write()
-            .await
-            .remove(&sync_id)
-            .ok_or_else(|| AppError::NotFound("sync session not found".to_string()))?;
-        let session = session.lock().await;
         let staging_dir = session.staging_dir.clone();
+        session.state = PushSessionState::Aborted;
+        self.sessions.write().await.remove(&sync_id);
         drop(session);
         let _ = tokio::fs::remove_dir_all(staging_dir).await;
         tracing::info!(
@@ -999,7 +1238,10 @@ impl SyncManager {
             "sync download requested"
         );
         let path = normalize_sync_path(&raw_path)?;
+        let project_lock = self.project_lock(&project).await?;
+        let _project_guard = project_lock.lock().await;
         let project_dir = self.project_dir(&project).await?;
+        ensure_path_has_no_links(project_dir.clone(), path.clone()).await?;
         let target = resolve_relative_path(&project_dir, &path)?;
         let entry = file_manifest_entry(&target, path.clone()).await?;
         let transfer = file_transfer(&entry)?;
@@ -1059,12 +1301,27 @@ impl SyncManager {
         tokio::fs::create_dir_all(&project_dir)
             .await
             .map_err(|err| AppError::Internal(format!("failed to create project dir: {err}")))?;
+        ensure_safe_project_root(self.config.workspace_root.clone(), project_dir.clone()).await?;
         tracing::debug!(
             project = %project,
             project_dir = %project_dir.display(),
             "sync project directory ready"
         );
         Ok(project_dir)
+    }
+
+    async fn project_lock(&self, project: &str) -> Result<Arc<AsyncMutex<()>>, AppError> {
+        // Validate before inserting an attacker-controlled key into the lock map.
+        resolve_project_dir(&self.config.workspace_root, project)?;
+        let key = project_lock_key(project);
+        if let Some(lock) = self.project_locks.read().await.get(&key).cloned() {
+            return Ok(lock);
+        }
+        let mut locks = self.project_locks.write().await;
+        Ok(locks
+            .entry(key)
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone())
     }
 
     async fn scan_manifest(
@@ -1089,14 +1346,24 @@ impl SyncManager {
 
     async fn session(&self, sync_id: Uuid) -> Result<Arc<AsyncMutex<PushSession>>, AppError> {
         let session = self.sessions.read().await.get(&sync_id).cloned();
-        if session.is_none() {
+        let Some(session) = session else {
             tracing::debug!(sync_id = %sync_id, "sync session not found");
+            return Err(AppError::NotFound("sync session not found".to_string()));
+        };
+        let mut guard = session.lock().await;
+        if guard.state != PushSessionState::Open {
+            return Err(AppError::NotFound("sync session is closed".to_string()));
         }
-        session.ok_or_else(|| AppError::NotFound("sync session not found".to_string()))
-    }
-
-    fn staging_dir(&self, project_dir: &Path, sync_id: Uuid) -> PathBuf {
-        project_dir.join(SYNC_DIR).join(sync_id.to_string())
+        if guard.expires_at <= Utc::now() {
+            guard.state = PushSessionState::Expired;
+            let staging_dir = guard.staging_dir.clone();
+            self.sessions.write().await.remove(&sync_id);
+            drop(guard);
+            let _ = tokio::fs::remove_dir_all(staging_dir).await;
+            return Err(AppError::NotFound("sync session expired".to_string()));
+        }
+        drop(guard);
+        Ok(session)
     }
 
     async fn reap_expired_sessions(&self) {
@@ -1114,9 +1381,13 @@ impl SyncManager {
         );
 
         for (sync_id, session) in sessions {
-            let expired = session.lock().await.expires_at <= now;
-            if expired && let Some(session) = self.sessions.write().await.remove(&sync_id) {
-                let staging_dir = session.lock().await.staging_dir.clone();
+            let mut guard = session.lock().await;
+            let expired = guard.state == PushSessionState::Open && guard.expires_at <= now;
+            if expired {
+                guard.state = PushSessionState::Expired;
+                let staging_dir = guard.staging_dir.clone();
+                self.sessions.write().await.remove(&sync_id);
+                drop(guard);
                 let _ = tokio::fs::remove_dir_all(&staging_dir).await;
                 tracing::info!(
                     sync_id = %sync_id,
@@ -1125,6 +1396,19 @@ impl SyncManager {
                 );
             }
         }
+    }
+}
+
+fn project_lock_key(project: &str) -> String {
+    #[cfg(windows)]
+    {
+        // Project names are ASCII-only. Folding their case makes aliases such
+        // as Demo and demo share a lock on Windows' case-insensitive paths.
+        project.to_ascii_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        project.to_string()
     }
 }
 
@@ -1236,7 +1520,10 @@ fn scan_manifest_blocking(
             )));
         }
         let file_type = entry.file_type();
-        if file_type.is_symlink() {
+        let link_metadata = std::fs::symlink_metadata(entry.path()).map_err(|err| {
+            AppError::Internal(format!("failed to inspect filesystem entry: {err}"))
+        })?;
+        if file_type.is_symlink() || metadata_is_link(&link_metadata) {
             return Err(AppError::BadRequest(format!(
                 "symlink is not supported: {path}"
             )));
@@ -1290,6 +1577,7 @@ fn scan_manifest_blocking(
         }
     }
 
+    synthesize_parent_dirs(&mut entries, max_entries)?;
     entries.sort_by(|left, right| left.path.cmp(&right.path));
     tracing::debug!(
         project_dir = %project_dir.display(),
@@ -1370,6 +1658,9 @@ fn validate_client_manifest(
                         entry.path
                     )));
                 }
+                // The wire format accepts either hex case; normalize once so
+                // comparisons and upload verification use a canonical digest.
+                entry.sha256 = Some(sha.to_ascii_lowercase());
             }
             ManifestEntryKind::Dir => {
                 entry.size_bytes = None;
@@ -1379,6 +1670,7 @@ fn validate_client_manifest(
         }
         validated.push(entry);
     }
+    synthesize_parent_dirs(&mut validated, max_entries)?;
     validated.sort_by(|left, right| left.path.cmp(&right.path));
     tracing::debug!(
         input_entries,
@@ -1390,6 +1682,57 @@ fn validate_client_manifest(
         "client sync manifest validated"
     );
     Ok(validated)
+}
+
+fn synthesize_parent_dirs(
+    entries: &mut Vec<ManifestEntry>,
+    max_entries: usize,
+) -> Result<(), AppError> {
+    let mut kinds: HashMap<String, ManifestEntryKind> = entries
+        .iter()
+        .map(|entry| (entry.path.clone(), entry.kind))
+        .collect();
+    let paths: Vec<String> = entries.iter().map(|entry| entry.path.clone()).collect();
+
+    for path in paths {
+        for parent in parent_paths(&path) {
+            match kinds.get(&parent) {
+                Some(ManifestEntryKind::File) => {
+                    return Err(AppError::BadRequest(format!(
+                        "file is an ancestor of another manifest entry: {parent}"
+                    )));
+                }
+                Some(ManifestEntryKind::Dir) => {}
+                None => {
+                    if entries.len() >= max_entries {
+                        return Err(AppError::BadRequest(format!(
+                            "manifest exceeds sync_max_manifest_entries ({max_entries}) after adding parent directories"
+                        )));
+                    }
+                    kinds.insert(parent.clone(), ManifestEntryKind::Dir);
+                    entries.push(ManifestEntry {
+                        path: parent,
+                        kind: ManifestEntryKind::Dir,
+                        size_bytes: None,
+                        mtime_unix_ms: None,
+                        sha256: None,
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parent_paths(path: &str) -> Vec<String> {
+    let mut parents = Vec::new();
+    let mut current = path;
+    while let Some((parent, _)) = current.rsplit_once('/') {
+        parents.push(parent.to_string());
+        current = parent;
+    }
+    parents.reverse();
+    parents
 }
 
 fn manifest_map(entries: Vec<ManifestEntry>) -> HashMap<String, ManifestEntry> {
@@ -1608,6 +1951,126 @@ async fn ensure_baseline_matches(
     .map_err(|err| AppError::Internal(format!("baseline check task failed: {err}")))?
 }
 
+async fn ensure_safe_project_root(
+    workspace_root: PathBuf,
+    project_dir: PathBuf,
+) -> Result<(), AppError> {
+    tokio::task::spawn_blocking(move || {
+        let workspace_root = workspace_root.canonicalize().map_err(|err| {
+            AppError::Internal(format!("failed to canonicalize workspace root: {err}"))
+        })?;
+        let metadata = std::fs::symlink_metadata(&project_dir).map_err(|err| {
+            AppError::Internal(format!("failed to inspect project directory: {err}"))
+        })?;
+        if !metadata.is_dir() || metadata_is_link(&metadata) {
+            return Err(AppError::BadRequest(
+                "project path must be a real directory, not a link or reparse point".to_string(),
+            ));
+        }
+        let canonical = project_dir.canonicalize().map_err(|err| {
+            AppError::Internal(format!("failed to canonicalize project directory: {err}"))
+        })?;
+        if canonical.parent() != Some(workspace_root.as_path()) {
+            return Err(AppError::BadRequest(
+                "project directory escapes workspace_root".to_string(),
+            ));
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|err| AppError::Internal(format!("project path check failed: {err}")))?
+}
+
+async fn ensure_path_has_no_links(root: PathBuf, normalized_path: String) -> Result<(), AppError> {
+    tokio::task::spawn_blocking(move || {
+        let root_metadata = std::fs::symlink_metadata(&root)
+            .map_err(|err| AppError::Internal(format!("failed to inspect sync root: {err}")))?;
+        if !root_metadata.is_dir() || metadata_is_link(&root_metadata) {
+            return Err(AppError::BadRequest(
+                "sync root is not a real directory".to_string(),
+            ));
+        }
+        let mut current = root;
+        for part in normalized_path.split('/') {
+            current.push(part);
+            match std::fs::symlink_metadata(&current) {
+                Ok(metadata) if metadata_is_link(&metadata) => {
+                    return Err(AppError::BadRequest(format!(
+                        "links and reparse points are not supported in sync paths: {normalized_path}"
+                    )));
+                }
+                Ok(metadata) if !metadata.is_dir() => break,
+                Ok(_) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => break,
+                Err(err) => {
+                    return Err(AppError::Internal(format!(
+                        "failed to inspect sync path: {err}"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|err| AppError::Internal(format!("sync path check failed: {err}")))?
+}
+
+async fn create_staging_dir(project_dir: &Path, sync_id: Uuid) -> Result<PathBuf, AppError> {
+    let sync_root = project_dir.join(SYNC_DIR);
+    match tokio::fs::symlink_metadata(&sync_root).await {
+        Ok(metadata) if metadata.is_dir() && !metadata_is_link(&metadata) => {}
+        Ok(_) => {
+            return Err(AppError::BadRequest(
+                "internal sync directory must not be a link or reparse point".to_string(),
+            ));
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            tokio::fs::create_dir(&sync_root).await.map_err(|err| {
+                AppError::Internal(format!("failed to create internal sync directory: {err}"))
+            })?;
+        }
+        Err(err) => {
+            return Err(AppError::Internal(format!(
+                "failed to inspect internal sync directory: {err}"
+            )));
+        }
+    }
+    let metadata = tokio::fs::symlink_metadata(&sync_root)
+        .await
+        .map_err(|err| AppError::Internal(format!("failed to verify sync directory: {err}")))?;
+    if !metadata.is_dir() || metadata_is_link(&metadata) {
+        return Err(AppError::BadRequest(
+            "internal sync directory must not be a link or reparse point".to_string(),
+        ));
+    }
+    let staging_dir = sync_root.join(sync_id.to_string());
+    tokio::fs::create_dir(&staging_dir)
+        .await
+        .map_err(|err| AppError::Internal(format!("failed to create staging dir: {err}")))?;
+    tokio::fs::create_dir(staging_dir.join("files"))
+        .await
+        .map_err(|err| AppError::Internal(format!("failed to create staging files dir: {err}")))?;
+    Ok(staging_dir)
+}
+
+fn metadata_is_link(metadata: &Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        // Junctions and other reparse points are not always reported by
+        // `FileType::is_symlink`, but they can redirect traversal just as well.
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 async fn set_file_mtime(path: PathBuf, mtime_unix_ms: i64) -> Result<(), AppError> {
     tracing::trace!(
         path = %path.display(),
@@ -1637,6 +2100,7 @@ fn normalize_sync_path(raw: &str) -> Result<String, AppError> {
 
 fn normalize_sync_path_allow_internal(raw: &str) -> Result<String, AppError> {
     if raw.is_empty()
+        || raw.len() > 4096
         || raw == "."
         || raw == ".."
         || raw.starts_with('/')
@@ -1650,7 +2114,7 @@ fn normalize_sync_path_allow_internal(raw: &str) -> Result<String, AppError> {
 
     let mut parts = Vec::new();
     for part in raw.split('/') {
-        if part.is_empty() || part == "." || part == ".." {
+        if part.is_empty() || part == "." || part == ".." || !validate_portable_segment(part) {
             return Err(AppError::BadRequest("invalid sync path".to_string()));
         }
         parts.push(part);
@@ -1850,5 +2314,73 @@ mod tests {
         )
         .unwrap();
         assert_eq!(entries.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn stale_session_arc_observes_committed_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = AppConfig {
+            listen_addr: "127.0.0.1:0".to_string(),
+            vivado_path: PathBuf::from("vivado"),
+            workspace_root: temp.path().to_path_buf(),
+            auth_tokens: vec!["secret".to_string()],
+            max_active_sessions: 1,
+            heartbeat_timeout_secs: 120,
+            output_buffer_bytes: 1024,
+            api_json_body_limit_bytes: 1024 * 1024,
+            session_retention_secs: 60,
+            stdin_max_bytes: 1024,
+            sync_max_file_bytes: 1024,
+            sync_max_manifest_entries: 100,
+            sync_session_ttl_secs: 60,
+            tls: None,
+        };
+        let manager = SyncManager::new(config);
+        let plan = manager
+            .push_plan("demo".to_string(), PushPlanRequest::default())
+            .await
+            .unwrap();
+        let stale = manager.session(plan.sync_id).await.unwrap();
+
+        manager
+            .commit(
+                "demo".to_string(),
+                plan.sync_id,
+                CommitSyncRequest::default(),
+            )
+            .await
+            .unwrap();
+
+        let guard = stale.lock().await;
+        assert_eq!(guard.state, PushSessionState::Committed);
+        assert!(ensure_push_session_open(&guard).is_err());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn project_lock_is_shared_by_windows_case_aliases() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = AppConfig {
+            listen_addr: "127.0.0.1:0".to_string(),
+            vivado_path: PathBuf::from("vivado"),
+            workspace_root: temp.path().to_path_buf(),
+            auth_tokens: vec!["secret".to_string()],
+            max_active_sessions: 1,
+            heartbeat_timeout_secs: 120,
+            output_buffer_bytes: 1024,
+            api_json_body_limit_bytes: 1024 * 1024,
+            session_retention_secs: 60,
+            stdin_max_bytes: 1024,
+            sync_max_file_bytes: 1024,
+            sync_max_manifest_entries: 100,
+            sync_session_ttl_secs: 60,
+            tls: None,
+        };
+        let manager = SyncManager::new(config);
+
+        let upper = manager.project_lock("Demo").await.unwrap();
+        let lower = manager.project_lock("demo").await.unwrap();
+
+        assert!(Arc::ptr_eq(&upper, &lower));
     }
 }
