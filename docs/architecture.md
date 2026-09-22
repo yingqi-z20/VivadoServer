@@ -1,94 +1,59 @@
 # Architecture and invariants
 
-`vivado-server` has two stateful subsystems behind one authenticated Axum
-router:
+VivadoServer is a Linux service for one trusted client workflow at a time. The workflow owns the global slot across source preparation, Vivado execution, and output transfer. A token grants administrative Tcl execution as the service account; filesystem validation is not a sandbox for Tcl or for another local writer.
 
-- `SessionManager` owns Vivado PTYs, process lifecycle, output cursors,
-  heartbeats, and the active-session semaphore.
-- `SyncManager` owns manifest comparison, upload staging, per-project locks,
-  optimistic baselines, and commit rollback state.
+## Ownership and state
 
-The health endpoint is intentionally process health only. It does not start
-Vivado or scan every project.
+`AppRuntime` validates startup input, acquires exclusive workspace ownership, constructs project, workflow, session, and sync services, and owns shutdown. Router construction does not start background tasks. Authentication digests are separate from non-secret runtime configuration; raw configured tokens do not remain in cloned service settings.
 
-## Vivado session lifecycle
+The client chooses a UUID for `PUT /v1/workflows/{id}`. The same ID and creation parameters observe the existing workflow; changed parameters conflict. A different ID cannot acquire the single slot while a workflow is active. This identity is retained only within the process and configured terminal retention, so clients must use a new UUID for each new workflow.
 
-Creating a session reserves a semaphore permit before creating the project
-directory and spawning the PTY. One blocking task reads PTY bytes, one waits for
-process exit, and API calls write stdin through the PTY writer. UTF-8 decoding
-retains incomplete trailing byte sequences between OS reads. The exit watcher
-briefly waits for the output reader to drain so terminal status does not race
-the last output chunk.
+```text
+preparing -> running -> pulling -> completed
+     |          |          |
+     +----------+----------+-> stopping -> cancelled
+     |          |
+     +----------+-> failed
+```
 
-Heartbeat timeout and explicit delete use the same termination path: send
-`exit`, wait for the child-exit notification, then kill after the grace period.
-On Windows the forced path uses `taskkill /T` so the batch wrapper's loader and
-Vivado descendants are terminated as one process tree.
-Terminal metadata remains queryable until `session_retention_secs`. Normal
-server shutdown terminates all live children before the Tokio runtime exits.
+Only preparing permits push; at most one push plan is open. Starting a session requires that the complete upload, when required, has committed and no plan remains open. One workflow creates one session. Only natural process exit with code zero permits pulling. Tcl output is diagnostic text: a command error that leaves Vivado running or exits zero does not by itself fail the workflow. The client must encode its own build acceptance criteria in Tcl and the final exit code.
 
-On Windows, AMD's `vivado.bat` must prepare the runtime environment. The server
-therefore invokes batch entry points through `cmd.exe`, removes the unsupported
-verbatim prefix from the ConPTY working directory, and rejects cmd
-metacharacters in arguments. `.exe`/`.com` entry points remain direct launches.
+Pulling permits output planning and downloads. Finish succeeds only after active transfers release their leases. It is idempotent after completion. Cancellation stops admission, cancels transfers, completes required process and sync cleanup, then releases the slot. A process still stopping must not free capacity. `cleanup_pending` reports unfinished cleanup separately from the operation's business state.
 
-## Sync lifecycle
+Heartbeat deadlines use monotonic time and apply throughout preparing, running, and pulling. Wall-clock timestamps are display metadata. Terminal workflows are bounded by age and count; their session output remains bounded as well.
 
-Push is a two-phase operation:
+## Project validity and synchronization
 
-1. Plan scans a filtered server manifest, validates and normalizes the client
-   manifest, captures the server baseline, and creates a per-sync staging area.
-2. Upload streams each requested file into a random temporary file, verifies
-   byte count and SHA-256, then renames it into staging.
-3. Commit acquires the project lock, rechecks every affected baseline path,
-   moves deletions/replacements into a same-filesystem rollback directory, and
-   installs staged files. Any ordinary error reverses applied changes in reverse
-   order and restores uploads to staging.
+The workspace contains server metadata under `.vivado-server`. An exclusive `flock` remains held by service ownership, including background work. Projects have durable clean/dirty markers outside their synchronized trees. A reusable project requires an exact clean marker and a real project directory; absent, unknown, linked, or truncated state never grants reuse.
 
-Plans, manifest scans, downloads, and commits share a per-project lock where
-they need a consistent server-side view. Uploads do not touch the project tree;
-operations within one push session are serialized by its mutex. This prevents
-commit/abort from racing an in-flight upload.
+New or dirty projects require `reset_project:true` and a complete manifest without include/exclude filters. Reset stages a replacement project and requests every file, regardless of existing hashes. Once validated, commit installs that complete tree; paths absent from it are discarded. `entries:[]` deliberately describes an empty project. A valid existing project supports normal incremental planning, with deletion of extra paths controlled by `delete_extra`. Deletions necessary for a file/directory type replacement are part of the replacement operation, including when `delete_extra=false`.
 
-`delete_extra=false` protects unrelated extra paths. A conflicting file versus
-directory at the exact requested path is still a required type replacement and
-is reported in the delete lists. A non-empty directory-to-file replacement
-requires `delete_extra=true`; excluded/unplanned directory contents cause a
-conflict and rollback rather than silent deletion.
+Before modifying a project or launching Vivado, the service persists dirty state. A clean marker is published only after the relevant writers have stopped and data has been synchronized to storage. A failed or forcibly stopped Vivado leaves the project requiring full re-upload.
 
-## Path boundary
+Staging lives at `<workspace>/.vivado-server/staging/<sync-id>`, outside every project tree. Reset keeps the replaced tree there as rollback material until the operation succeeds. Staging and rollback are process-local transaction support, not a restart journal. Startup discards disposable staging; it does not replay interrupted commits or reconstruct their HTTP results. The trusted client replaces uncertain projects with a complete upload. Operators must never fabricate a clean marker to bypass this boundary.
 
-Project names are one portable path segment. Sync paths are normalized `/`
-relative paths. Lexical validation rejects traversal, absolute/drive paths,
-Windows device names, control characters, invalid trailing characters, and the
-internal staging directory. Before direct access or mutation, the server also
-walks existing ancestors with `symlink_metadata`; Windows reparse-point
-attributes are checked in addition to ordinary symlinks.
+Push states are `open`, `committing`, `committed`, `aborted`, `expired`, and `failed`; cleanup is a separate Boolean. A committed result remains committed even if disposable staging cleanup needs retry. Settled results are bounded by configured retention and a service-wide count of 128; completed plans release their working buffers. Each workflow also retains at most its 128 newest plan references. `force` is absent: conflicting optimistic baselines require a new workflow or plan as allowed by its phase, never an unchecked overwrite switch.
 
-This ancestor check materially limits accidental and adversarial traversal, but
-it is not an OS-level `openat` capability. A separate local process with write
-access to the workspace can still race filesystem checks. Treat
-`workspace_root` as server-owned and do not run multiple server instances over
-the same root.
+Uploads stream into random temporary files, enforcing both configured and planned size, idle timeout, total deadline, and SHA-256. Verified bytes replace staging atomically. Failed or cancelled upload retries preserve a previous verified version. Accepted commit/reset work belongs to the manager, so dropping an HTTP waiter does not cancel project mutation or rollback. Rollback is attempted on ordinary in-process failures; failed rollback makes the project unsuitable for incremental reuse.
 
-## Failure model
+## Process and output lifecycle
 
-Rollback covers errors returned while the server process remains alive. It is
-not a durable transaction journal: power loss or process termination during the
-mutation window can leave staging/rollback artifacts or a partially applied
-tree. Clients should keep their source manifest, use `force=false`, and re-plan
-after any ambiguous connection loss. Generated Vivado outputs should be
-reproducible rather than the sole copy of valuable data.
+`portable-pty` creates the Linux PTY. The service configures raw terminal mode to avoid canonical line-length truncation, then uses nonblocking file descriptors through Tokio `AsyncFd` for cancellation-aware I/O. Input is written as UTF-8 bytes without kernel echo or newline conversion. Output can still contain terminal control sequences. Vivado always runs in Tcl mode; arguments are bounded and cannot override its mode. A blocked input writer must not prevent stop or shutdown; control characters sent to stdin are not a substitute for the termination API.
 
-Vivado itself is an external writer and does not participate in the project
-lock. Recommended sequencing remains push, run Vivado, then pull. Avoid commit
-while Vivado is reading or writing the same paths.
+Session state distinguishes `running`, `stopping`, `exited`, `terminated`, and `failed`. A terminal state requires confirmed process death and reaping. Successful completion is a client-issued Tcl `exit 0`; explicit termination uses process-group TERM/KILL with bounded deadlines. The outer systemd unit must use `KillMode=control-group`; processes that deliberately create another session are beyond process-group containment.
 
-## Verification
+The output reader incrementally decodes UTF-8 and fills a byte-bounded ring. Cursors identify output chunks, not byte positions. `overrun` means requested history was evicted; `output_truncated` also exposes final drain truncation. Clients must concatenate chunks as a stream, since prompts, lines, and UTF-8 reads need not align with chunk boundaries. Output notification is registered before inspecting the buffer to avoid missed wakeups.
 
-Unit and HTTP integration tests cover authentication, error shape and body
-limits, PTY output/cursors, heartbeats, path validation, Windows junction
-rejection, manifest normalization, type replacement, optimistic conflict,
-concurrent commits, abort, and rollback. The Windows launch path has also been
-exercised against Vivado 2024.2 through a real PTY by waiting for `Vivado%`,
-sending Tcl over stdin, and reading the reported version.
+## Transfers and locking
+
+Workflow metadata locks do not span filesystem, process, or network I/O. Activity leases protect transfers from phase transitions; streamed downloads retain their lease until the response body finishes or is dropped. Finish rejects active leases. Cancellation wakes transfers before waiting for them. The admission gate and manager task registration share shutdown ordering, preventing new accepted mutations after the shutdown barrier.
+
+Sync activity locks coordinate uploads with commit and abort. Project operations serialize mutations without holding locks across a slow HTTP upload. Reapers perform opportunistic cleanup rather than waiting behind client transfers. Shutdown closes admission, wakes long polls and transfers, stops/reaps Vivado, and waits for accepted mutation and cleanup tasks within the configured grace. Exhausting the grace leaves affected projects dirty; it does not certify successful rollback.
+
+A file is opened and hashed using the same handle whose metadata is checked before and after hashing. The download then rewinds that handle and streams it. Content ETags cover SHA-256, not mtime or executable metadata. These checks detect ordinary concurrent changes before response headers; they do not freeze an inode throughout network transfer. Clients must validate complete body size/hash and expected metadata before installing a download.
+
+## Boundary conditions
+
+Project names are validated ASCII segments, at most 64 bytes. Sync paths are UTF-8 relative paths with `/` separators, bounded to 4096 bytes and 255 bytes per segment. Traversal, control characters, ambiguous separators, reserved server metadata, symlinks, and non-regular transfer files are rejected. Linux paths remain case-sensitive. Unix executable state is a Boolean: any ordinary execute bit reads as true, and installation sets or clears all three execute bits. Full modes, ownership, setuid/setgid, links, and directory timestamps are not synchronized.
+
+Path checks use ordinary filesystem APIs and do not eliminate races against another local process with write access. The workspace must belong to the service account. Process groups and file locks similarly do not prevent an authorized Tcl program from escaping the intended workflow; that is why the client and supplied Tcl remain trusted.

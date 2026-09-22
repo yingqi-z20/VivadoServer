@@ -1,19 +1,42 @@
+# All relative paths are resolved from this configuration file's directory.
 listen_addr = "127.0.0.1:8080"
-vivado_path = "vivado"
-workspace_root = "C:/vivado-workspaces"
-auth_tokens = ["change-me"]
+vivado_path = "/opt/Xilinx/Vivado/2024.2/bin/vivado"
+workspace_root = "/srv/vivado-server/workspaces"
 
-max_active_sessions = 1
+# Linux only. Each token must contain 32-4096 ASCII bearer-token characters:
+# letters, digits, - . _ ~ + / and optional trailing = padding.
+# Each file must be a regular 0600-style file (no group/other permissions)
+# containing one token, optionally followed by one LF or CRLF newline.
+auth_token_files = ["secrets/api-token"]
+
+# Inline tokens are development-only and cause a startup warning.
+auth_tokens = []
+
+# Keep false unless plaintext traffic is confined by a trusted VPN or an HTTPS
+# reverse proxy. Direct TLS can instead be configured below.
+allow_plaintext_non_loopback = false
+allow_run_as_root = false
+
+# Exactly one complete push -> Vivado -> pull workflow can run at a time.
 heartbeat_timeout_secs = 120
 output_buffer_bytes = 1048576
 api_json_body_limit_bytes = 67108864
-session_retention_secs = 3600
+workflow_retention_secs = 3600
+max_retained_workflows = 128
 stdin_max_bytes = 1048576
+json_idle_timeout_secs = 30
+json_deadline_secs = 120
 
 sync_max_file_bytes = 1073741824
 sync_max_manifest_entries = 200000
 sync_session_ttl_secs = 3600
+sync_result_retention_secs = 3600
+upload_idle_timeout_secs = 60
+upload_deadline_secs = 14400
+
+shutdown_grace_secs = 15
+max_in_flight_requests = 64
 
 # [tls]
-# cert_path = "server.crt"
-# key_path = "server.key"
+# cert_path = "secrets/server.crt"
+# key_path = "secrets/server.key"

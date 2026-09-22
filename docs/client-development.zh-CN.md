@@ -1,937 +1,252 @@
-# Vivado Server 客户端开发文档
+# VivadoServer 客户端开发文档
 
-本文面向客户端开发人员，说明如何通过 HTTP API 与 `vivado-server`
-交互，包括：
+本文定义 Linux workflow API，面向受信任的原生桌面或 CLI 客户端。运行中的 `/openapi.json` 提供机器可读契约。旧 `/v1/sessions`、`/v1/projects` 接口已移除；所有 JSON 请求对象拒绝未知字段。
 
-- 文件级同步：客户端工程推送到服务器、服务器产物拉回客户端。
-- 远程 Vivado 会话：启动 Vivado、发送 Tcl/CLI 输入、轮询输出、保活和终止。
+## 1. 获取工作流
 
-服务端只提供 HTTP API，不提供客户端 CLI。客户端需要自行实现本地文件扫描、
-manifest 生成、上传、下载、校验和本地删除。
+客户端先生成一个新 UUID，再发送 `PUT /v1/workflows/{workflow_id}`。本地保存该 ID，避免响应丢失后无法查询结果。所有受保护请求均需要 `Authorization: Bearer <token>`。
 
-## 1. 基础约定
-
-### 1.1 Base URL
-
-示例使用：
-
-```text
-http://127.0.0.1:8080
-```
-
-生产环境可以：
-
-- 直接启用服务端 TLS。
-- 或使用 Nginx/Caddy/Traefik 等反向代理终止 HTTPS。
-
-### 1.2 认证
-
-除 `GET /healthz` 外，所有 `/v1/*` 接口都需要 Bearer Token：
-
-```http
-Authorization: Bearer <token>
-```
-
-未认证或 token 错误时返回：
-
-```http
-401 Unauthorized
-Content-Type: application/json
-
-{"error":"unauthorized"}
-```
-
-### 1.3 请求体格式
-
-- JSON 接口使用 `Content-Type: application/json`。
-- 文件上传接口直接发送原始字节流，不要 base64。
-- 文件下载接口直接返回原始字节流，校验信息放在响应头中。
-
-### 1.4 错误格式
-
-所有错误响应都是 JSON：
-
+<!-- contract:CreateWorkflowRequest -->
 ```json
 {
-  "error": "human-readable message"
+  "project": "demo",
+  "reset_project": true
 }
 ```
 
-常见状态码：
+服务只有一个全局工作槽。其他 workflow 正在活动时返回 `409 workflow_busy`。使用相同 ID 和创建参数重复 PUT 会返回已有记录；参数不同则冲突。这种幂等身份仅在服务进程及保留期内有效，每次新任务都应生成新 ID。
 
-| 状态码 | 含义 |
-|---:|---|
-| 400 | 请求格式错误、路径非法、manifest 非法、上传大小或 SHA-256 不匹配 |
-| 401 | 未认证或 token 无效 |
-| 404 | session、sync session 或文件不存在 |
-| 409 | 冲突，例如 commit 前服务器文件被改动、缺少上传文件、会话数量超限 |
-| 413 | JSON 请求超过 `api_json_body_limit_bytes` |
-| 500 | 服务端内部错误 |
-
-未知 `/v1/*` 路由和参数提取错误也使用同一种 JSON 格式；未知的版本化路由仍需
-认证。`500` 的主机路径和操作系统细节只写入服务端日志，不返回给客户端。
-
-## 2. 项目名和路径规则
-
-### 2.1 Project 名称
-
-`project` 出现在以下 URL 中：
-
-```text
-/v1/projects/{project}/...
-```
-
-以及创建 Vivado session 时的 JSON body 中：
-
+<!-- contract:WorkflowInfo -->
 ```json
 {
-  "project": "demo"
+  "workflow_id": "8e47a0ac-c6f5-4af0-a491-f9e7ce98efaf",
+  "project": "demo",
+  "status": "preparing",
+  "session_id": null,
+  "requires_full_upload": true,
+  "cleanup_pending": false,
+  "started_at": "2026-09-12T00:00:00Z",
+  "last_heartbeat_at": "2026-09-12T00:00:00Z",
+  "ended_at": null,
+  "error_code": null,
+  "error_message": null
 }
 ```
 
-合法 project 名称：
+工程没有有效 clean 标记时，必须设置 `reset_project:true`，否则返回 `409 project_reupload_required`。reset 会在提交时用完整客户端 manifest 替换整个服务器工程；manifest 中没有的文件会被移除。已有有效工程可使用 `reset_project:false`，按需增量 push 后运行，或直接启动 Vivado。
 
-- 非空。
-- 不能是 `.` 或 `..`。
-- 只允许 ASCII 字母、数字、`_`、`-`、`.`。
-- 最长 64 字节，不能以 `.` 结尾。
-- 不能是 `CON`、`NUL`、`COM1`、`LPT1` 等 Windows 设备名。
+准备、执行和拉取的全部阶段都要调用 `POST /v1/workflows/{workflow_id}/heartbeat`。默认超时 120 秒，建议客户端每 30 秒发送一次。传输活动和输出轮询不能替代显式心跳。终态默认保留 3600 秒，最多 128 个 workflow。
 
-合法示例：
+| 工作流状态 | 可执行的后续操作 |
+|---|---|
+| `preparing` | 读取 manifest、push，完成必要上传后启动唯一会话 |
+| `running` | Tcl stdin/output 和心跳 |
+| `pulling` | manifest、pull plan/download，最后 finish |
+| `stopping` | 等待清理，工作槽仍被占用 |
+| `completed` / `cancelled` / `failed` | 查询保留结果，新任务使用新 workflow |
 
-```text
-demo
-demo-1
-board_a.xpr
-```
+通过 `GET /v1/workflows/{workflow_id}` 观察状态。`DELETE` 取消 workflow 并清理已接受的操作，在终态可幂等调用。`POST .../finish` 仅完成 pulling；存在活动传输时返回 409，已完成时可重试。确认 workflow 终态后再停止心跳。
 
-非法示例：
+## 2. 路径与 manifest
 
-```text
-../demo
-demo/sub
-demo:1
-项目
-```
+工程名是一个非空 ASCII 段，可含字母、数字、`_`、`-` 和 `.`，最长 64 字节；`.`、`..` 和内部元数据名 `.vivado-server` 保留。Linux 名称大小写敏感。
 
-服务端会把合法 project 映射到：
+同步路径是 UTF-8 相对路径，使用 `/` 分隔，最长 4096 字节，每段最长 255 字节。拒绝空段、`.`/`..`、绝对路径、控制字符、`: < > " | ? *`、反斜线和保留的 `.vivado-server` 段。不支持符号链接和非普通文件。URL 逐段编码，保留段之间的斜线。
 
-```text
-workspace_root/<project>
-```
+文件条目需要 `size_bytes`、`mtime_unix_ms` 和 64 位十六进制 SHA-256。下方 push 示例描述六个字节 `hello\n`。目录条目使用 `{"path":"rtl","kind":"dir"}`，不同步目录时间；缺失的父目录会自动补全。客户端应通过同一文件句柄计算哈希并比较读取前后元数据，文件变化时重新扫描。
 
-### 2.2 同步文件路径
+文件相等比较大小、毫秒 mtime、SHA-256 和 `executable`。Linux 中任意普通执行位存在即为 true；安装时 true 设置全部 `0111` 位，false 清除全部执行位。不保留精确权限掩码、所有权、特殊权限位或链接。
 
-同步路径必须是 project 内的 UTF-8 相对路径，并统一使用 `/` 分隔。
+在 preparing 或 pulling 中，可向 `POST .../sync/manifest` 发送以下请求读取服务器视图：
 
-合法示例：
-
-```text
-src/top.tcl
-rtl/core.v
-constraints/top.xdc
-out/result.txt
-```
-
-非法示例：
-
-```text
-                         # 空路径
-.
-..
-../x
-/absolute/path
-a\b
-C:/x
-a:b
-a//b
-.vivado-server-sync/state
-```
-
-规则：
-
-- Windows 客户端也必须把 `\` 转成 `/`。
-- 不能发送绝对路径。
-- 不能包含 `.` 或 `..` 段。
-- 不能包含 Windows drive prefix，例如 `C:`。
-- 不能访问 `.vivado-server-sync/`，这是服务端内部 staging 目录。
-- 路径段不能包含控制字符、以点/空格结尾、使用 Windows 设备名或超过 255 个
-  UTF-8 字节；完整路径上限为 4096 字节。
-- 不支持 symlink、junction 和其他 reparse point；已有祖先目录中的链接也会被拒绝。
-- URL 中的 `{path}` 是通配路径。普通 Vivado 工程路径通常可以直接拼到
-  `/files/` 后面；如果路径段包含特殊字符，客户端应按 URL path segment
-  做 percent-encoding。
-
-## 3. Manifest 数据模型
-
-客户端需要扫描本地目录并生成 manifest。服务端也会扫描服务器 project
-目录生成 manifest。
-
-服务端会把 SHA-256 统一为小写，并为已接受的嵌套路径补齐缺失的父目录 entry。
-如果某个 file entry 是另一个 entry 的祖先，manifest 会被拒绝。
-
-### 3.1 File Entry
-
+<!-- contract:ManifestRequest -->
 ```json
 {
-  "path": "src/top.tcl",
-  "kind": "file",
-  "size_bytes": 1234,
-  "mtime_unix_ms": 1700000000000,
-  "sha256": "64位十六进制SHA-256"
-}
-```
-
-### 3.2 Directory Entry
-
-```json
-{
-  "path": "src",
-  "kind": "dir",
-  "mtime_unix_ms": 1700000000000
-}
-```
-
-字段说明：
-
-| 字段 | file | dir | 说明 |
-|---|---|---|---|
-| `path` | 必填 | 必填 | 规范化后的相对路径 |
-| `kind` | 必填 | 必填 | `file` 或 `dir` |
-| `size_bytes` | 必填 | 忽略 | 文件字节数 |
-| `mtime_unix_ms` | 必填 | 可选 | Unix epoch 毫秒 |
-| `sha256` | 必填 | 忽略 | 文件内容 SHA-256，十六进制 |
-
-v1 只支持普通文件和目录，不支持 symlink、权限位、owner/group、可执行位等元数据。
-
-### 3.3 文件相等判断
-
-服务端认为两个文件相同，当且仅当以下字段全部相同：
-
-- `size_bytes`
-- `mtime_unix_ms`
-- `sha256`
-
-这意味着如果客户端无法保留 mtime，后续同步可能会再次认为文件发生变化。
-
-### 3.4 服务端限制
-
-默认配置：
-
-```toml
-sync_max_file_bytes = 1073741824
-sync_max_manifest_entries = 200000
-sync_session_ttl_secs = 3600
-```
-
-含义：
-
-- 单文件最大 1 GiB。
-- 单次 manifest 最多 200000 个 entry。
-- push sync session 默认 3600 秒后过期并清理 staging。
-
-## 4. Glob 过滤
-
-同步请求可以携带过滤规则：
-
-```json
-{
-  "include_globs": ["src/**", "constraints/**"],
-  "exclude_globs": ["**/*.tmp", ".git/**"]
-}
-```
-
-规则：
-
-- 过滤规则只对单次请求生效。
-- 服务端没有默认 include/exclude 配置。
-- `include_globs` 为空时，表示包含所有未被 exclude 的路径。
-- `include_globs` 非空时，路径必须至少匹配一个 include。
-- 只要匹配任意 exclude，就会被排除。
-- `.vivado-server-sync` 和 `.vivado-server-sync/**` 永远被服务端排除。
-
-Vivado 工程 push 的常见排除项：
-
-```json
-[
-  ".git/**",
-  ".Xil/**",
-  "*.jou",
-  "*.log",
-  "*.str",
-  "*.cache/**",
-  "*.runs/**",
-  "*.sim/**"
-]
-```
-
-注意：push 时通常排除生成物；pull 时可能正好需要包含某些生成目录，例如
-`out/**` 或特定 bitstream 输出目录。
-
-## 5. Push 同步：客户端到服务器
-
-Push 用于把客户端本地工程同步到服务器的 `workspace_root/<project>`。
-
-流程：
-
-1. 客户端扫描本地 project 目录，生成 manifest。
-2. 调用 `POST /v1/projects/{project}/sync/push/plan`。
-3. 服务端返回 `sync_id`、需要上传的文件、需要创建的目录，以及可选删除列表。
-4. 客户端对 `upload_files` 中每个文件调用 `PUT` 上传原始字节流。
-5. 客户端调用 `commit`。
-6. 服务端把 staging 中的文件移动到 project 目录；如果 `delete_extra=true`，
-   则删除服务器端多余文件。
-
-关键语义：
-
-- commit 之前不会覆盖 project 文件。
-- `upload_files` 里的文件必须全部上传，否则 commit 返回 `409`。
-- `sync_id` 会过期；过期后服务端可删除 staging。
-- commit 默认做乐观冲突检测：如果 plan 后服务器目标文件变了，返回 `409`。
-- `force=true` 会跳过冲突检测并覆盖目标文件。
-
-### 5.1 创建 Push Plan
-
-```http
-POST /v1/projects/{project}/sync/push/plan
-Authorization: Bearer <token>
-Content-Type: application/json
-```
-
-请求：
-
-```json
-{
-  "entries": [
-    {
-      "path": "src",
-      "kind": "dir",
-      "mtime_unix_ms": 1700000000000
-    },
-    {
-      "path": "src/top.tcl",
-      "kind": "file",
-      "size_bytes": 1234,
-      "mtime_unix_ms": 1700000000000,
-      "sha256": "..."
-    }
-  ],
-  "delete_extra": false,
   "include_globs": [],
-  "exclude_globs": [".git/**", ".Xil/**"]
-}
-```
-
-响应：
-
-```json
-{
-  "sync_id": "8f6989d1-8a61-4dbb-98e4-b24a408729e2",
-  "upload_files": [
-    {
-      "path": "src/top.tcl",
-      "size_bytes": 1234,
-      "mtime_unix_ms": 1700000000000,
-      "sha256": "..."
-    }
-  ],
-  "create_dirs": ["src"],
-  "delete_files": [],
-  "delete_dirs": [],
-  "expires_at": "2026-06-27T12:34:56Z"
-}
-```
-
-字段含义：
-
-- `upload_files`：客户端必须上传的文件。
-- `create_dirs`：commit 时服务端会创建的目录。
-- `delete_files`：commit 将删除的服务器文件。额外文件只在 `delete_extra=true`
-  时出现；同路径 file/dir 类型冲突即使在 `false` 时也会出现。
-- `delete_dirs`：对应的目录删除。把非空目录替换成文件必须使用
-  `delete_extra=true`。
-- `expires_at`：sync session 过期时间。
-
-### 5.2 上传文件
-
-```http
-PUT /v1/projects/{project}/sync/{sync_id}/files/{path}
-Authorization: Bearer <token>
-Content-Type: application/octet-stream
-```
-
-请求 body 是文件原始字节。
-
-示例：
-
-```sh
-curl -X PUT \
-  -H "Authorization: Bearer change-me" \
-  --data-binary @src/top.tcl \
-  "http://127.0.0.1:8080/v1/projects/demo/sync/8f6989d1-8a61-4dbb-98e4-b24a408729e2/files/src/top.tcl"
-```
-
-响应：
-
-```json
-{
-  "path": "src/top.tcl",
-  "size_bytes": 1234,
-  "sha256": "..."
-}
-```
-
-服务端校验：
-
-- `path` 必须在 plan 返回的 `upload_files` 中。
-- 上传字节数必须等于 `size_bytes`。
-- 上传内容 SHA-256 必须等于 `sha256`。
-- 文件大小不能超过 `sync_max_file_bytes`。
-
-客户端建议：
-
-- 上传时流式读取本地文件。
-- 不要把文件放进 JSON。
-- 不要 base64。
-- 如果本地文件在上传过程中变化，应取消本轮 sync 并重新 plan。
-
-### 5.3 Commit
-
-```http
-POST /v1/projects/{project}/sync/{sync_id}/commit
-Authorization: Bearer <token>
-Content-Type: application/json
-```
-
-请求：
-
-```json
-{
-  "force": false
-}
-```
-
-响应：
-
-```json
-{
-  "sync_id": "8f6989d1-8a61-4dbb-98e4-b24a408729e2",
-  "status": "committed",
-  "uploaded_files": ["src/top.tcl"],
-  "created_dirs": ["src"],
-  "deleted_files": [],
-  "deleted_dirs": []
-}
-```
-
-冲突处理：
-
-- `force=false` 时，服务端检查 plan 时的服务器文件 SHA-256 是否仍然匹配。
-- 如果目标文件被其他进程或用户改动，返回 `409`。
-- `force=true` 跳过冲突检测，直接覆盖本轮 sync 涉及的目标文件。
-
-原子性与并发：
-
-- 同一 project 的 plan/commit 会串行执行，两个 commit 不会同时通过同一份 baseline。
-- commit 先把待覆盖或删除的路径移动到同文件系统的 rollback 区；后续任一步失败时，
-  已完成的修改会恢复，上传文件也会放回 staging，允许修正后重试。
-- 如果目录内存在未纳入 plan 的内容，服务端不会静默删除它，而是返回 `409` 并回滚。
-
-推荐客户端行为：
-
-- 默认使用 `force=false`。
-- 遇到 `409` 时提示用户“服务器文件在同步期间发生变化”，并重新 plan。
-- 只有用户明确确认覆盖时才使用 `force=true`。
-
-### 5.4 Abort
-
-```http
-DELETE /v1/projects/{project}/sync/{sync_id}
-Authorization: Bearer <token>
-```
-
-响应：
-
-```json
-{
-  "sync_id": "8f6989d1-8a61-4dbb-98e4-b24a408729e2",
-  "status": "aborted"
-}
-```
-
-Abort 只删除 staging，不修改 project 文件。客户端在取消上传、上传失败或退出同步流程时，
-应尽量调用 abort。
-
-## 6. Pull 同步：服务器到客户端
-
-Pull 用于把服务器生成物或服务器 project 状态同步回客户端。
-
-流程：
-
-1. 客户端扫描本地目录，生成 manifest。
-2. 调用 `POST /v1/projects/{project}/sync/pull/plan`。
-3. 服务端返回需要下载的文件、需要创建的目录，以及可选本地删除列表。
-4. 客户端下载 `download_files` 中每个文件。
-5. 客户端校验响应头中的 size 和 SHA-256。
-6. 如果 `delete_extra=true`，客户端根据响应里的删除列表删除本地多余文件。
-
-注意：
-
-- Pull 不创建服务端 sync session。
-- Pull 响应中的 `delete_files` / `delete_dirs` 是客户端本地删除指令，
-  服务端不会替客户端删除本地文件。
-
-### 6.1 创建 Pull Plan
-
-```http
-POST /v1/projects/{project}/sync/pull/plan
-Authorization: Bearer <token>
-Content-Type: application/json
-```
-
-请求：
-
-```json
-{
-  "entries": [
-    {
-      "path": "src/top.tcl",
-      "kind": "file",
-      "size_bytes": 1234,
-      "mtime_unix_ms": 1700000000000,
-      "sha256": "..."
-    }
-  ],
-  "delete_extra": true,
-  "include_globs": ["out/**"],
   "exclude_globs": []
 }
 ```
 
-响应：
+glob 列表最多 256 项，每项最多 4096 字节。include 为空表示全部包含，exclude 优先。reset push 的两个列表必须为空，确保 manifest 描述完整替换工程。
 
-```json
-{
-  "download_files": [
-    {
-      "path": "out/result.txt",
-      "size_bytes": 2048,
-      "mtime_unix_ms": 1700000010000,
-      "sha256": "..."
-    }
-  ],
-  "create_dirs": ["out"],
-  "delete_files": ["old.txt"],
-  "delete_dirs": []
-}
-```
+## 3. Push 与提交查询
 
-字段含义：
+发送 `POST /v1/workflows/{workflow_id}/sync/push/plan`：
 
-- `download_files`：客户端应下载的服务器文件。
-- `create_dirs`：客户端应创建的本地目录。
-- `delete_files`：仅当请求 `delete_extra=true` 时，客户端应删除的本地文件。
-- `delete_dirs`：仅当请求 `delete_extra=true` 时，客户端应删除的本地目录。
-
-### 6.2 下载文件
-
-```http
-GET /v1/projects/{project}/sync/files/{path}
-Authorization: Bearer <token>
-```
-
-响应头：
-
-```http
-Content-Type: application/octet-stream
-Content-Length: <size>
-x-sync-size-bytes: <size>
-x-sync-mtime-unix-ms: <mtime>
-x-sync-sha256: <sha256>
-```
-
-响应 body 是文件原始字节。
-
-客户端要求：
-
-- 下载到临时文件。
-- 下载时计算 SHA-256。
-- 校验下载字节数等于 `x-sync-size-bytes`。
-- 校验 SHA-256 等于 `x-sync-sha256`。
-- 校验通过后再原子 rename 到目标路径。
-- 平台支持时设置本地 mtime 为 `x-sync-mtime-unix-ms`。
-
-## 7. 获取服务器 Manifest
-
-客户端也可以单独请求服务器 manifest，用于调试或自定义比较逻辑。
-
-```http
-POST /v1/projects/{project}/sync/manifest
-Authorization: Bearer <token>
-Content-Type: application/json
-```
-
-请求：
-
-```json
-{
-  "include_globs": [],
-  "exclude_globs": [".git/**", ".Xil/**"]
-}
-```
-
-响应：
-
+<!-- contract:PushPlanRequest -->
 ```json
 {
   "entries": [
     {
-      "path": "src",
-      "kind": "dir",
-      "mtime_unix_ms": 1700000000000
-    },
-    {
-      "path": "src/top.tcl",
+      "path": "input.txt",
       "kind": "file",
-      "size_bytes": 1234,
+      "size_bytes": 6,
       "mtime_unix_ms": 1700000000000,
-      "sha256": "..."
+      "sha256": "5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03",
+      "executable": false
     }
+  ],
+  "delete_extra": false,
+  "include_globs": [],
+  "exclude_globs": []
+}
+```
+
+push 和 pull 都必须提供 `entries`；显式空数组合法，在 reset 中表示有意安装空工程。响应包含 `sync_id`、`upload_files`、`create_dirs`、`delete_files`、`delete_dirs` 和 `expires_at`。同时只能开放一个计划，先提交或取消该计划，再创建下一个计划或 Vivado 会话。
+
+reset 要求上传 manifest 的全部文件，即使旧工程中有相同内容，也必须重新上传。它替换整棵工程树，不受 `delete_extra` 控制。普通增量 push 的 `delete_extra` 只控制无关额外项的删除；文件/目录类型替换所必需的删除仍属于替换操作。替换非空目录时必须允许删除其内容。
+
+对每个返回的 upload 流式发送精确原始字节：
+
+```http
+PUT /v1/workflows/{workflow_id}/sync/{sync_id}/files/{path}
+Authorization: Bearer <token>
+Content-Type: application/octet-stream
+Content-Length: <计划大小>
+```
+
+已知长度超限会在读取正文前拒绝，chunked 上传超过计划即停止。正文大小及哈希必须匹配，并受到空闲和总时限约束。失败的重试保留之前验证成功的 staged 文件；计划仍开放时可用相同正文重试。
+
+向 `POST .../sync/{sync_id}/commit` 发送严格空对象：
+
+<!-- contract:CommitSyncRequest -->
+```json
+{}
+```
+
+不提供 `force` 参数。已接受的提交在 HTTP 断线后继续。创建替代任务前，先查询 `GET .../sync/{sync_id}`，或在 workflow 阶段允许时重试 commit。
+
+<!-- contract:SyncStatusResponse -->
+```json
+{
+  "sync_id": "c0af7449-eaac-4c61-912f-0d9b4c79d393",
+  "project": "demo",
+  "status": "committed",
+  "cleanup_pending": false,
+  "result": {
+    "sync_id": "c0af7449-eaac-4c61-912f-0d9b4c79d393",
+    "status": "committed",
+    "uploaded_files": [
+      "input.txt"
+    ],
+    "created_dirs": [],
+    "deleted_files": [],
+    "deleted_dirs": []
+  }
+}
+```
+
+同步状态为 `open`、`committing`、`committed`、`aborted`、`expired` 或 `failed`。`cleanup_pending` 独立于业务结果：committed 且仍待清理表示项目修改已成功。失败提供 `error_code`、`error_message`。`DELETE .../sync/{sync_id}` 取消开放计划，不能打断正在执行的 commit。结果受同步保留期限制。
+
+workflow 失败或返回 `project_reupload_required` 时，保留可信本地源码，用新 UUID 创建 reset workflow，再上传完整 manifest。服务重启后不保留旧 workflow/sync ID；新建时根据响应决定是否必须 reset。
+
+## 4. 运行并结束 Vivado
+
+准备完成后发送 `POST /v1/workflows/{workflow_id}/session`：
+
+<!-- contract:StartSessionRequest -->
+```json
+{
+  "args": [
+    "-nolog",
+    "-nojournal"
   ]
 }
 ```
 
-如果服务器 project 目录不存在，服务端会创建目录并返回空 manifest。
+服务端强制 `-mode tcl`，不得传入 `-mode`、`-gui`、`-batch` 或 `-tcl`。参数最多 128 项、总计 32 KiB，不能含 NUL。工程由 workflow 指定，会话请求不包含 project。每个 workflow 最多创建一个会话。
 
-## 8. Vivado Session API
+向 `POST .../session/stdin` 发送 Tcl：
 
-同步 API 负责文件，session API 负责远程 Vivado 进程控制。
-
-### 8.1 创建 Session
-
-```http
-POST /v1/sessions
-Authorization: Bearer <token>
-Content-Type: application/json
-```
-
-请求：
-
+<!-- contract:SendInputRequest -->
 ```json
 {
-  "project": "demo",
-  "args": ["-mode", "tcl"]
+  "text": "puts [version -short]\n"
 }
 ```
 
-响应：
+输入受到 `stdin_max_bytes` 限制，通过 raw PTY 按 UTF-8 字节写入，没有内核回显或 CRLF 转换。终止会话应调用 API，不能假定 stdin 控制字符会触发信号；输出仍可能包含终端控制序列。使用 `GET .../session/output?cursor=0&timeout_ms=30000` 轮询，每次用响应 cursor 发起下次请求：
 
+<!-- contract:OutputResponse -->
 ```json
 {
-  "session_id": "0d7e0c3a-2ca7-4725-b875-3e9a9f34bb3c",
-  "project": "demo",
-  "status": "running",
-  "started_at": "2026-06-27T12:00:00Z",
-  "last_heartbeat_at": "2026-06-27T12:00:00Z",
-  "exit_code": null
-}
-```
-
-服务端会在 `workspace_root/<project>` 中启动 Vivado。Windows 下，未带扩展名的
-绝对 `vivado_path` 会自动解析到同目录的 `.bat` 包装器；包装器经 `cmd.exe` 启动，
-含 cmd 元字符的参数会被拒绝。复杂 Tcl 命令应通过 stdin 发送，而不是放在 `args` 中。
-
-### 8.2 发送输入
-
-```http
-POST /v1/sessions/{session_id}/stdin
-Authorization: Bearer <token>
-Content-Type: application/json
-```
-
-请求：
-
-```json
-{
-  "text": "open_project demo.xpr\n"
-}
-```
-
-服务端会把 `text` 写入 Vivado 进程 stdin。客户端需要自己追加换行。
-当 UTF-8 `text` 超过 `stdin_max_bytes` 时请求会被拒绝。
-
-### 8.3 轮询输出
-
-```http
-GET /v1/sessions/{session_id}/output?cursor=0&timeout_ms=30000
-Authorization: Bearer <token>
-```
-
-响应：
-
-```json
-{
-  "cursor": 12,
+  "cursor": 1,
   "chunks": [
     {
       "seq": 0,
-      "timestamp": "2026-06-27T12:00:01Z",
-      "text": "Vivado ..."
+      "timestamp": "2026-09-12T00:00:00Z",
+      "text": "Vivado% "
     }
   ],
   "status": "running",
-  "overrun": false
+  "overrun": false,
+  "output_truncated": false
 }
 ```
 
-客户端行为：
+把 chunk text 作为字节解码后的文本流拼接，chunk 边界不代表行或 prompt 边界。`overrun` 表示请求的旧输出被淘汰；`output_truncated` 表示发生输出截断，包括最终排空超时。客户端应显示这两种情况。长轮询默认 30 秒，最大 60 秒，`timeout_ms=0` 立即返回。没有新输出的轮询仍是正常响应，不代表命令失败。服务关闭会取消普通等待。
 
-- 第一次请求用 `cursor=0`。
-- 每次响应后，下次请求使用响应里的 `cursor`。
-- `timeout_ms` 表示长轮询等待时间，服务端会限制最大值。
-- 如果 `overrun=true`，说明服务端输出环形缓冲已经丢弃旧内容。客户端应提示
-  “部分输出被截断”，然后继续使用新的 `cursor`。
+`GET .../session` 返回 `running`、`stopping`、`exited`、`terminated` 或 `failed`，以及退出码和终止原因。stopping 不表示进程已经死亡。`DELETE .../session` 是显式终止操作，会使未完成 workflow 失败，不能把它当作成功退出。
 
-### 8.4 Heartbeat
+应在检查构建结果后发送 Tcl `exit 0`。只有自然退出码为零且进程清理已确认，workflow 才进入 pulling。非零退出、强制停止、输出/输入失败或运行中断都会使工程需要全量重传。Tcl 输出含 `ERROR` 本身不决定成功；用 Tcl `catch` 或命令特定状态检查确认构建结果，不满足业务条件时以非零退出码结束。
 
-```http
-POST /v1/sessions/{session_id}/heartbeat
-Authorization: Bearer <token>
-```
+## 5. Pull 与释放工作槽
 
-客户端应定期发送 heartbeat。推荐间隔为 `heartbeat_timeout_secs / 3`。
-终态 session 的 heartbeat 返回 `409`。
+只有 pulling 接受 `POST /v1/workflows/{workflow_id}/sync/pull/plan`：
 
-### 8.5 查询和终止 Session
-
-```http
-GET /v1/sessions/{session_id}
-DELETE /v1/sessions/{session_id}
-Authorization: Bearer <token>
-```
-
-可能状态：
-
-```text
-running
-exited
-terminated
-failed
-```
-
-终态响应包含 `ended_at`。session 会保留 `session_retention_secs` 供查询，随后由
-reaper 清理。
-
-`DELETE` 会先尝试向 Vivado 写入 `exit\n`，短暂等待后强制 kill。
-
-## 9. 推荐客户端算法
-
-### 9.1 本地 Manifest 生成
-
-伪代码：
-
-```text
-manifest = []
-for each entry under local_project_root:
-    rel = convert_to_utf8_relative_path(entry)
-    rel = replace "\" with "/"
-    reject absolute path, "..", drive prefix
-    skip ".vivado-server-sync/"
-    apply include/exclude globs
-    if symlink:
-        reject or skip with warning
-    if directory:
-        manifest.push({ path: rel, kind: "dir", mtime_unix_ms })
-    if regular file:
-        sha256 = stream_sha256(file)
-        manifest.push({
-            path: rel,
-            kind: "file",
-            size_bytes,
-            mtime_unix_ms,
-            sha256
-        })
-sort manifest by path
-```
-
-注意：
-
-- SHA-256 必须流式计算。
-- 不要一次性把大文件读入内存。
-- 上传前最好再次确认文件 mtime/size 未变化；如果变化，重新生成 manifest。
-
-### 9.2 安全 Push
-
-伪代码：
-
-```text
-local_manifest = scan_local()
-plan = POST push/plan(local_manifest, filters, delete_extra)
-try:
-    for file in plan.upload_files:
-        PUT raw bytes to /sync/{sync_id}/files/{file.path}
-    POST /sync/{sync_id}/commit {"force": false}
-catch cancellation:
-    DELETE /sync/{sync_id}
-catch upload_or_commit_error:
-    DELETE /sync/{sync_id} if possible
-```
-
-重试建议：
-
-- 同一个文件内容未变化时，可以重试同一个 `PUT`。
-- 本地文件变化后，不要继续使用旧 plan，应重新 plan。
-- commit 返回 `409` 时优先重新 plan，不要自动 force。
-
-### 9.3 安全 Pull
-
-伪代码：
-
-```text
-local_manifest = scan_local()
-plan = POST pull/plan(local_manifest, filters, delete_extra)
-for dir in plan.create_dirs:
-    mkdir -p local_root/dir
-for file in plan.download_files:
-    download to local_root/file.path.tmp
-    verify size and sha256
-    rename tmp to local_root/file.path
-    apply mtime if possible
-if delete_extra:
-    delete plan.delete_files
-    delete plan.delete_dirs deepest-first
-```
-
-删除目录时必须 deepest-first，避免父目录非空导致删除失败。
-
-### 9.4 典型远程 Vivado 流程
-
-```text
-1. Push 本地工程源文件到服务器。
-2. 创建 Vivado session，project 使用同一个名称。
-3. 通过 stdin 发送 Tcl/Vivado 命令。
-4. 持续轮询 output，并定期 heartbeat。
-5. Vivado 完成后删除 session 或等待其退出。
-6. Pull 服务器上的结果文件或日志回客户端。
-```
-
-## 10. 并发和一致性
-
-服务端允许 Vivado session 运行时执行同步。客户端需要自己控制时机：
-
-- 推荐先 push，再启动 Vivado。
-- 不建议在 Vivado 正在读写同一工程时 push 覆盖源文件。
-- 推荐 Vivado 完成或进入明确 checkpoint 后再 pull 输出。
-- push commit 默认使用 `force=false`，这样可以发现 plan 后服务器文件被改动的情况。
-
-## 11. 平台兼容说明
-
-### Windows 客户端
-
-- 本地路径分隔符 `\` 必须转换为 `/` 后再发送。
-- 不要发送 drive prefix。
-- NTFS/FAT 的 mtime 精度可能不同，客户端应发送能获得的毫秒级 mtime。
-
-### Linux/macOS 客户端
-
-- v1 不支持 symlink。
-- v1 不同步权限位、owner/group、可执行位。
-
-### 大文件
-
-- 上传和下载都应使用流式 I/O。
-- 下载写入临时文件，校验成功后 rename。
-- 遵守 `sync_max_file_bytes`。
-
-## 12. 最小 Push 示例
-
-假设本地 `src/top.tcl` 内容为 `puts hello\n`。
-
-创建 plan：
-
+<!-- contract:PullPlanRequest -->
 ```json
-POST /v1/projects/demo/sync/push/plan
-
-{
-  "entries": [
-    {
-      "path": "src",
-      "kind": "dir",
-      "mtime_unix_ms": 1700000000000
-    },
-    {
-      "path": "src/top.tcl",
-      "kind": "file",
-      "size_bytes": 11,
-      "mtime_unix_ms": 1700000000000,
-      "sha256": "<sha256>"
-    }
-  ],
-  "delete_extra": false,
-  "include_globs": [],
-  "exclude_globs": []
-}
-```
-
-上传：
-
-```text
-PUT /v1/projects/demo/sync/<sync_id>/files/src/top.tcl
-```
-
-Commit：
-
-```json
-POST /v1/projects/demo/sync/<sync_id>/commit
-
-{
-  "force": false
-}
-```
-
-## 13. 最小 Pull 示例
-
-创建 pull plan：
-
-```json
-POST /v1/projects/demo/sync/pull/plan
-
 {
   "entries": [],
   "delete_extra": false,
-  "include_globs": ["out/**"],
+  "include_globs": [
+    "out/**"
+  ],
   "exclude_globs": []
 }
 ```
 
-下载返回的每个文件：
+对每个 `download_files` 条目携带内容摘要下载：
 
-```text
-GET /v1/projects/demo/sync/files/out/result.txt
+```http
+GET /v1/workflows/{workflow_id}/sync/files/{path}
+Authorization: Bearer <token>
+If-Match: "sha256:5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03"
 ```
 
-校验：
+响应包含 `ETag`、`x-sync-size-bytes`、`x-sync-mtime-unix-ms`、`x-sync-sha256` 和 `x-sync-executable`。内容哈希过期返回 412；仅修改元数据不会改变 ETag。响应前哈希阶段检测到文件变化返回 409，已经开始的正文无法事后改为 JSON 错误。
 
-```text
-sha256(downloaded bytes) == x-sync-sha256
-downloaded byte count == x-sync-size-bytes
+每个正文先流式写入本地临时文件。校验完整大小和哈希，同时比较响应元数据与计划，关闭文件后原子安装，再设置 mtime/执行位。遇到不匹配或中断时丢弃临时文件并重新 plan。类型替换所需的删除必须在安装替代项前执行。`delete_extra` 只控制无关额外项，不能用它跳过计划中的类型替换删除。目录按由深到浅的顺序删除。
+
+全部响应体结束、本地结果验证通过后调用 `POST .../finish`。若因活动传输返回 409，先读完或关闭对应正文，再重试。不要在下载正文仍被消费时释放 workflow。
+
+## 6. 错误与信任边界
+
+`GET /healthz`、`GET /readyz`、`GET /openapi.json` 不认证。就绪检查表示服务协调/清理状态，不启动 Vivado，也不证明许可证可用。应用响应都有 `x-request-id`；401 还包含 `WWW-Authenticate: Bearer`。
+
+```json
+{
+  "error": {
+    "code": "workflow_busy",
+    "message": "another workflow is active",
+    "request_id": "8e47a0ac-c6f5-4af0-a491-f9e7ce98efaf",
+    "details": {}
+  }
+}
 ```
 
-## 14. Endpoint 总表
+`details` 始终是对象；上报问题时记录 request ID。通过 code 区分 workflow 阶段冲突、工程重传和同步冲突，不要解析供人阅读的 message 决定业务分支。
 
-| Method | Path | 用途 |
-|---|---|---|
-| GET | `/healthz` | 健康检查，无需认证 |
-| POST | `/v1/projects/{project}/sync/manifest` | 获取服务器 manifest |
-| POST | `/v1/projects/{project}/sync/push/plan` | 规划客户端到服务器同步 |
-| PUT | `/v1/projects/{project}/sync/{sync_id}/files/{path}` | 上传计划内文件 |
-| POST | `/v1/projects/{project}/sync/{sync_id}/commit` | 提交 push sync |
-| DELETE | `/v1/projects/{project}/sync/{sync_id}` | 取消 push sync |
-| POST | `/v1/projects/{project}/sync/pull/plan` | 规划服务器到客户端同步 |
-| GET | `/v1/projects/{project}/sync/files/{path}` | 下载服务器文件 |
-| POST | `/v1/sessions` | 启动 Vivado session |
-| GET | `/v1/sessions/{session_id}` | 查询 session 状态 |
-| POST | `/v1/sessions/{session_id}/stdin` | 发送 Vivado 输入 |
-| GET | `/v1/sessions/{session_id}/output` | 轮询 Vivado 输出 |
-| POST | `/v1/sessions/{session_id}/heartbeat` | session 保活 |
-| DELETE | `/v1/sessions/{session_id}` | 终止 session |
+| HTTP 状态 | 含义 |
+|---|---|
+| 400 / 401 / 404 | 输入非法 / 认证失败 / 资源不存在或已过期 |
+| 408 / 413 | 请求正文超时 / 正文或文件大小超限 |
+| 409 | 工作槽占用、阶段错误、同步冲突或需要全量重传 |
+| 412 / 429 | 内容前置条件过期 / 有界请求容量耗尽 |
+| 500 / 503 | 内部错误 / 服务关闭或不可用 |
+
+HTTP 取消不会撤销已接受的状态变更，重连后查询权威状态。不要盲目重放 Tcl stdin：命令可能已经执行，stdin 接口不提供幂等命令队列。
+
+Bearer 权限允许通过 Tcl `exec` 以服务账号身份执行系统命令。使用专用账号、可信源码及内网/VPN，并由 TLS 或可信 HTTPS 边界保护传输。服务不提供浏览器 CORS 或代码执行沙箱。
+
+同步结果最多保留 `sync_result_retention_secs`，全服务同时最多保留 128 个已完成结果，因此旧结果可能在时间上限之前返回 404。每个工作流最多保留最近 128 个计划的引用。客户端应自行保存需要留存的结果，不将服务端查询接口作为审计归档。
