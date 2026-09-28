@@ -877,3 +877,107 @@ async fn history_pruning_preserves_active_and_pending_cleanup_sessions() {
     ));
     manager.shutdown().await;
 }
+
+#[test]
+fn manifest_filters_skip_unselected_linux_names_and_large_generated_files() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(temp.path().join("src")).unwrap();
+    std::fs::write(temp.path().join("src/top.v"), b"module top; endmodule").unwrap();
+    std::fs::create_dir_all(temp.path().join("build/run:1")).unwrap();
+    std::fs::write(temp.path().join("build/run:1/illegal?.rpt"), b"generated").unwrap();
+    std::fs::write(temp.path().join("bad|name"), b"generated").unwrap();
+    // A sparse oversized output must be skipped before metadata size limits or
+    // hashing. Otherwise this tiny source-only scan fails (or hashes 1 TiB).
+    std::fs::File::create(temp.path().join("build/huge.bit"))
+        .unwrap()
+        .set_len(1 << 40)
+        .unwrap();
+    std::os::unix::fs::symlink("/etc/passwd", temp.path().join("build/link")).unwrap();
+    let manifest = scan_manifest_blocking(
+        temp.path().into(),
+        SyncFilters::new(&["src/top.v".into()], &[]).unwrap(),
+        10,
+        64,
+    )
+    .unwrap();
+    let paths: Vec<_> = manifest
+        .entries
+        .iter()
+        .map(|entry| entry.path.as_str())
+        .collect();
+    assert_eq!(paths, ["src", "src/top.v"]);
+    assert_eq!(
+        manifest.entries[1].sha256.as_deref(),
+        Some(format!("{:x}", Sha256::digest(b"module top; endmodule")).as_str())
+    );
+}
+
+#[test]
+fn manifest_selection_still_rejects_nonportable_names_and_selected_links() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("safe.v"), b"source").unwrap();
+    std::fs::write(temp.path().join("run:1.rpt"), b"generated").unwrap();
+    std::os::unix::fs::symlink("/etc/passwd", temp.path().join("linked.v")).unwrap();
+    for include in [vec![], vec!["run:1.rpt".into()], vec!["linked.v".into()]] {
+        let result = scan_manifest_blocking(
+            temp.path().into(),
+            SyncFilters::new(&include, &[]).unwrap(),
+            10,
+            64,
+        );
+        assert!(
+            matches!(result, Err(AppError::BadRequest(_))),
+            "{include:?}"
+        );
+    }
+    let manifest = scan_manifest_blocking(
+        temp.path().into(),
+        SyncFilters::new(&[], &["run:1.rpt".into(), "linked.v".into()]).unwrap(),
+        10,
+        64,
+    )
+    .unwrap();
+    assert_eq!(manifest.entries.len(), 1);
+    assert_eq!(manifest.entries[0].path, "safe.v");
+}
+
+#[test]
+fn manifest_filters_prune_reserved_metadata_and_explicitly_excluded_directories() {
+    let temp = tempfile::tempdir().unwrap();
+    for name in [".vivado-server", "cache:generated"] {
+        std::fs::create_dir(temp.path().join(name)).unwrap();
+        std::fs::write(temp.path().join(name).join("bad?.bin"), b"generated").unwrap();
+    }
+    std::fs::write(temp.path().join("top.v"), b"source").unwrap();
+    let manifest = scan_manifest_blocking(
+        temp.path().into(),
+        SyncFilters::new(&[], &["cache:generated".into()]).unwrap(),
+        10,
+        64,
+    )
+    .unwrap();
+    assert_eq!(manifest.entries.len(), 1);
+    assert_eq!(manifest.entries[0].path, "top.v");
+}
+
+#[test]
+fn raw_manifest_paths_enforce_root_boundary_components_and_utf8() {
+    use std::os::unix::ffi::OsStrExt;
+    let root = Path::new("/workspace/project");
+    for path in [
+        "/workspace/other/top.v",
+        "/workspace/project/../secret",
+        "/workspace/project",
+    ] {
+        assert!(
+            raw_relative_path_from_disk(Path::new(path), root).is_err(),
+            "{path}"
+        );
+    }
+    let non_utf8 = root.join(std::ffi::OsStr::from_bytes(b"bad\xff"));
+    assert!(raw_relative_path_from_disk(&non_utf8, root).is_err());
+    assert_eq!(
+        raw_relative_path_from_disk(&root.join("build/run:1.rpt"), root).unwrap(),
+        "build/run:1.rpt"
+    );
+}

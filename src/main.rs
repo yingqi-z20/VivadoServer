@@ -2,7 +2,7 @@ use anyhow::Context;
 use clap::Parser;
 use std::{future::Future, net::SocketAddr, path::PathBuf, time::Duration};
 use tokio::signal;
-use vivado_server::{AppConfig, AppRuntime, initialize_logging};
+use vivado_server::{AppConfig, AppRuntime, initialize_logging_with_root};
 
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
@@ -15,7 +15,7 @@ struct Args {
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let config = AppConfig::from_file(&args.config).context("failed to load configuration")?;
-    let logging = initialize_logging(&config.observability)?;
+    let logging = initialize_logging_with_root(&config.observability, &config.workspace_root)?;
     tracing::info!(
         event = "service.starting",
         version = env!("CARGO_PKG_VERSION"),

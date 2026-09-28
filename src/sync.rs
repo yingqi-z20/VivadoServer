@@ -174,15 +174,17 @@ impl SyncManager {
         }
         let telemetry = self.config.telemetry.clone();
         let mut observed = SyncOperation::new(telemetry, operation, true)
+            .with_history(self.config.history.clone())
             .with_failure_marker(self.task_degraded.clone());
+        let context = crate::history::context();
         let task = self.tasks.spawn(
-            async move {
+            crate::history::scoped(context, async move {
                 // Record the result inside the accepted task: dropping the HTTP
                 // observer must not discard the original filesystem failure.
                 let result = work.await;
                 observed.finish_result(&result);
                 result
-            }
+            })
             .in_current_span(),
         );
         drop(gate);
@@ -279,7 +281,8 @@ impl SyncManager {
         request: ManifestRequest,
     ) -> Result<ManifestResponse, AppError> {
         let mut observed =
-            SyncOperation::new(self.config.telemetry.clone(), "sync_manifest", false);
+            SyncOperation::new(self.config.telemetry.clone(), "sync_manifest", false)
+                .with_history(self.config.history.clone());
         let result = async {
             self.scan_manifest(
                 resolve_project_dir(&self.config.workspace_root, &project)?,
@@ -496,7 +499,8 @@ impl SyncManager {
         request: PullPlanRequest,
     ) -> Result<PullPlanResponse, AppError> {
         let mut observed =
-            SyncOperation::new(self.config.telemetry.clone(), "sync_pull_plan", false);
+            SyncOperation::new(self.config.telemetry.clone(), "sync_pull_plan", false)
+                .with_history(self.config.history.clone());
         let result = self.create_pull_plan(project, request).await;
         observed.finish_result(&result);
         result
@@ -603,6 +607,7 @@ impl SyncManager {
                 .receive_upload(project, sync_id, raw_path, content_length, body)
                 .await?;
             manager.config.telemetry.add_bytes("sync_upload", response.size_bytes);
+            manager.config.history.record(crate::history::Event::new("sync.upload_staged",None,None,None,serde_json::json!({"sync_id":sync_id,"path":response.path,"size_bytes":response.size_bytes})));
             tracing::debug!(path = %response.path, bytes = response.size_bytes, "sync upload validated and staged");
             Ok(response)
         })
@@ -723,6 +728,7 @@ impl SyncManager {
         if let Some(plan) = plan {
             let mut observed =
                 SyncOperation::new(self.config.telemetry.clone(), "sync_commit", true)
+                    .with_history(self.config.history.clone())
                     .with_failure_marker(self.task_degraded.clone());
             tracing::info!(%sync_id, %project, reset = plan.reset,
                 upload_files = plan.upload_files.len(), "sync commit started");
@@ -1129,7 +1135,8 @@ impl SyncManager {
         if_match: Option<String>,
     ) -> Result<Response, AppError> {
         let mut observed =
-            SyncOperation::new(self.config.telemetry.clone(), "sync_download", false);
+            SyncOperation::new(self.config.telemetry.clone(), "sync_download", false)
+                .with_history(self.config.history.clone());
         match self.prepare_download(project, raw_path, if_match).await {
             Ok((response, size)) => {
                 Ok(response.map(|body| Body::new(ObservedDownload::new(body, size, observed))))
@@ -1151,7 +1158,8 @@ impl SyncManager {
             self.config.telemetry.clone(),
             "sync_download_metadata",
             false,
-        );
+        )
+        .with_history(self.config.history.clone());
         let result = self
             .prepare_download(project, raw_path, if_match)
             .await

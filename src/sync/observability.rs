@@ -21,6 +21,8 @@ pub(super) struct SyncOperation {
     supervised: bool,
     failure_marker: Option<Arc<AtomicBool>>,
     finished: bool,
+    history: crate::history::History,
+    history_event: crate::history::Event,
 }
 
 impl SyncOperation {
@@ -34,9 +36,21 @@ impl SyncOperation {
             supervised,
             failure_marker: None,
             finished: false,
+            history: crate::history::History::default(),
+            history_event: crate::history::Event::new(
+                "sync.operation",
+                None,
+                None,
+                None,
+                serde_json::json!({"operation":kind}),
+            ),
         }
     }
 
+    pub(super) fn with_history(mut self, history: crate::history::History) -> Self {
+        self.history = history;
+        self
+    }
     pub(super) fn with_failure_marker(mut self, marker: Arc<AtomicBool>) -> Self {
         self.failure_marker = Some(marker);
         self
@@ -46,6 +60,7 @@ impl SyncOperation {
         match result {
             Ok(_) => self.finish("success"),
             Err(error) => {
+                self.history_event.data["error_code"] = serde_json::json!(error.code());
                 self.span.in_scope(|| {
                     if !matches!(
                         self.kind,
@@ -72,6 +87,11 @@ impl SyncOperation {
         }
         self.finished = true;
         let duration = self.started.elapsed();
+        self.history_event.data["outcome"] = serde_json::json!(outcome);
+        self.history_event.data["duration_ms"] = serde_json::json!(duration.as_millis() as u64);
+        if self.kind != "sync_reaper" || outcome != "success" {
+            self.history.record(self.history_event.clone());
+        }
         self.telemetry
             .operation_finished(self.kind, outcome, duration);
         self.telemetry.add_active(self.kind, -1);
@@ -138,6 +158,9 @@ impl ObservedDownload {
                     "sync download body completed"
                 );
             });
+            self.observed.history_event.data["bytes"] = serde_json::json!(self.bytes);
+            self.observed.history_event.data["expected_bytes"] =
+                serde_json::json!(self.expected_bytes);
             self.observed.finish(outcome);
         }
     }

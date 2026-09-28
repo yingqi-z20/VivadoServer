@@ -99,7 +99,7 @@ pub(super) fn scan_manifest_blocking(
             if entry.depth() == 0 {
                 return true;
             }
-            relative_path_from_disk(entry.path(), &project_dir)
+            raw_relative_path_from_disk(entry.path(), &project_dir)
                 .map(|path| filters.should_descend(&path))
                 .unwrap_or(true)
         });
@@ -110,7 +110,12 @@ pub(super) fn scan_manifest_blocking(
         if entry.depth() == 0 {
             continue;
         }
-        let path = relative_path_from_disk(entry.path(), &project_dir)?;
+        // Filtering applies to the actual project-relative name before the
+        // portable wire-path restrictions. Vivado may leave unselected names
+        // (for example `run:1`) that are valid on Linux but invalid for sync.
+        // Derivation still checks the root boundary, normal components and
+        // strict UTF-8; selected paths receive the complete validation below.
+        let path = raw_relative_path_from_disk(entry.path(), &project_dir)?;
         if !filters.matches_entry(&path) {
             skipped_by_filter += 1;
             tracing::trace!(
@@ -120,6 +125,7 @@ pub(super) fn scan_manifest_blocking(
             );
             continue;
         }
+        let path = normalize_sync_path(&path)?;
         if entries.len() >= max_entries {
             return Err(AppError::BadRequest(format!(
                 "manifest exceeds sync_max_manifest_entries ({max_entries})"
@@ -764,7 +770,7 @@ pub(super) fn resolve_relative_path(
     Ok(path)
 }
 
-pub(super) fn relative_path_from_disk(path: &Path, root: &Path) -> Result<String, AppError> {
+pub(super) fn raw_relative_path_from_disk(path: &Path, root: &Path) -> Result<String, AppError> {
     let rel = path.strip_prefix(root).map_err(|err| {
         AppError::Internal(format!("failed to derive relative manifest path: {err}"))
     })?;
@@ -786,7 +792,12 @@ pub(super) fn relative_path_from_disk(path: &Path, root: &Path) -> Result<String
             }
         }
     }
-    normalize_sync_path_allow_internal(&parts.join("/"))
+    if parts.is_empty() {
+        return Err(AppError::BadRequest(
+            "empty filesystem path in project".to_string(),
+        ));
+    }
+    Ok(parts.join("/"))
 }
 
 pub(super) fn is_internal_path(path: &str) -> bool {

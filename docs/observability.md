@@ -18,7 +18,9 @@ archive_retention_secs = 604800
 archive_max_sessions = 128
 ```
 
-日志写 stdout，由 systemd/journald 或部署环境负责落盘、轮转和转发。服务日志队列最多 4096 条消息；下游阻塞时丢弃新日志并累计 `vivado_server_log_dropped_messages`，避免阻塞业务。正常关闭会尝试排空队列，但进程强杀、崩溃或收集器长期阻塞不能保证日志完整。初始化日志之前的配置错误和 Rust 原有 panic/backtrace 输出可能是普通 stderr 文本。
+可执行服务同时将日志写到 stdout 与 `<workspace_root>/.vivado-server/service-logs/service.log`，默认使用 JSON；`log_format` 同时影响两个目标。文件在 20 MiB 或 UTC 日期变化时轮转，最多保留 5 份（当前文件和 `.1` 到 `.4`），按日志分段日期清理达到 14 天的文件；数量/大小限制可能更早淘汰。启动时执行清理，后续写入时每分钟至多检查一次；完全静默时在下一次启动或写入时清理。目录权限 0700、文件权限 0600。路径逐级拒绝符号链接，文件拒绝硬链接和非普通文件；独立文件锁阻止两个服务同时轮转。单条记录超过 20 MiB 时仅送 stdout，文件写入故障会在 stderr 提示且不阻断 stdout。`vivado_server_log_file_write_failures` 单独统计文件写入、刷新或保留检查失败。库入口 `initialize_logging` 保持仅 stdout 的兼容行为，`initialize_logging_with_root` 启用双写。
+
+stdout 的保存、轮转和转发仍由 systemd/journald 或部署环境负责。服务日志队列最多 4096 条消息；下游阻塞时丢弃新日志并累计 `vivado_server_log_dropped_messages`，避免阻塞业务。正常关闭会尝试排空队列，但进程强杀、崩溃或收集器长期阻塞不能保证日志完整。服务文件日志用于运维诊断，不是可信用户操作审计。初始化日志之前的配置错误和 Rust 原有 panic/backtrace 输出可能是普通 stderr 文本。
 
 `RUST_LOG` 覆盖 `log_filter`，无效或空过滤规则使日志初始化失败。临时调试可在启动进程前设置：
 
@@ -83,6 +85,7 @@ journalctl -u vivado-server --since '15 minutes ago' -o cat --no-pager |
 | `vivado_server_background_task_failures_total` | 受监督任务意外结束次数，`task` |
 | `vivado_server_ready` | 当前就绪状态，1 为就绪、0 为未就绪；抓取时更新 |
 | `vivado_server_log_dropped_messages` | 有界服务日志队列自进程启动以来的丢弃数；是 gauge，抓取时更新 |
+| `vivado_server_log_file_write_failures` | 服务文件写入、刷新或保留检查失败次数；是 gauge，抓取时更新；stdout 可继续输出 |
 | `vivado_server_uptime_seconds` / `vivado_server_start_time_seconds` | 运行时存活秒数 / 初始化的 Unix 时间 |
 | `vivado_server_build_info` | 构建版本，`version`，值为 1 |
 
@@ -182,3 +185,81 @@ sudo -u vivado-server jq -j 'select(.event == "output") | .text' "$ARCHIVE"
 出现 `workflow_cleanup_failed` 时先按 workflow/session 日志查 PID、终止原因、清理重试和恢复事件，结合状态 API 查看 `cleanup_pending`；在确认进程退出前不要手动释放工作槽。出现 `background_task_failed` 时保留任务名称、panic/错误和关联 ID，按 [部署指南](deployment-linux.md) 的进程清理边界处理后再恢复服务。仅归档失败不会自动使 readiness 失败，应通过独立归档告警发现。
 
 许可证或 Vivado 启动问题仍需在服务身份下检查安装环境和许可证，并运行实际工作流验证。不要把监控端点可用等同于编译成功，也不要因日志/归档缺失就盲目重放 Tcl stdin。
+
+## Private durable history journal
+
+The optional `[history]` configuration enables a journal independent of the
+live PTY ring and of clients calling `/session/output`. Platform deployments set
+`enabled = true`; standalone deployments default to false. Enabling history
+replaces the older diagnostic PTY archive to avoid keeping duplicate output.
+
+```toml
+[history]
+enabled = true
+max_bytes = 536870912
+retention_secs = 604800
+session_head_bytes = 8388608
+session_tail_bytes = 58720256
+```
+
+The journal records workflow and session lifecycles, parsed stdin intent and
+actual write completion, decoded PTY output, sync operations and upload metadata.
+It does not copy source-file contents, authentication headers or bearer tokens.
+Stdin and output are intentionally sensitive user history: the platform must
+keep these out of ordinary service logs and audit administrative access. Output
+has no command request ID because Vivado can emit asynchronous messages; byte
+offsets and session IDs identify its ordered stream. Stdin chunks and completion
+share an `input_id` and the original request correlation IDs.
+
+`GET /internal/history/v1/events?after=0&limit=256` requires the normal internal
+core bearer token. This endpoint must **not** be exposed through the public
+native `/v1` gateway. Its page contains `journal_id`, current `instance_id`,
+`events`, `next_cursor`, `head_cursor`, `earliest_cursor`, `has_more`, `gaps` and
+`recording_state`. Resume from `next_cursor`, the last delivered/scanned sequence;
+`head_cursor` is the committed global high sequence. `earliest_cursor` is one
+less than the oldest retained sequence. Gaps explicitly report unavailable
+ranges, and can overlap retained events when old gap summaries are coalesced.
+Never remove an otherwise present event just because it overlaps a gap summary.
+
+Each event has `seq`, its own `instance_id`, RFC3339 `timestamp`, `event`, optional
+workflow/session/project/request IDs and `data`. Journal IDs and sequences
+survive core restart; instance IDs do not. Restart interruption events retain
+the old instance ID and mark unsealed work `unknown`, without claiming that the
+Vivado command completed. A newly accepted `workflow.created` event's sequence
+identifies a new attempt even when a native client reuses a workflow UUID. A
+valid UUID `x-platform-request-id` is copied into `data.parent_request_id` for
+correlation only; it never grants authorization.
+
+Output and stdin text are split at UTF-8 boundaries into at most 4096-byte chunks.
+Events are at most 32 KiB including JSON escaping, and pages are at most 2 MiB.
+The queue is bounded to 8 MiB; ordinary output is batched and fsynced independently
+of the live ring. Per session the first 8 MiB and last 56 MiB are retained by
+default. Total retained JSON is capped at 512 MiB, seven days and 100,000 events;
+whichever limit is reached first applies. Queue pressure, disk errors and
+retention produce explicit gap metadata. New work and stdin fail with the
+existing `429 capacity_reached` envelope when critical recording cannot be
+confirmed. Stop, cancel and heartbeat remain available. Large permitted stdin
+is journaled in bounded batches before any of its bytes reach the PTY.
+
+The fixed spool is `.vivado-server/history-v1/{state.json,events.jsonl}` below
+the workspace root. Directory/file modes are 0700/0600. The writer pins the
+directory descriptor and rejects symlinks, devices and hard-linked files. The
+atomic `state.json` (at most 64 KiB) contains the same IDs plus internal
+`next_cursor` (the global head), `earliest_cursor`, `session_head_bytes`,
+`session_windows`, `gaps` and open lifecycle recovery metadata. `events.jsonl`
+is at most 544 MiB including deferred garbage; compaction occurs at bounded
+thresholds, rather than rewriting the spool after every event. An offline
+reader must omit sequences at or below `earliest_cursor`, and omit output
+chunks with `session_head_bytes <= byte_offset < session_windows[session_id]`.
+The stopped-container operator uses exactly this format and does not start the
+container to export it. A complete line beyond the last persisted state cursor
+can be replayed after a crash; an incomplete trailing line is not an event.
+
+This local spool belongs to the same Unix user as Vivado and is a bounded
+recovery buffer, not tamper-proof evidence. The manager's archive outside the
+container supplies longer retention (180 days), trusted account association,
+access control and access auditing. If the manager is unavailable beyond local
+retention, missing content is explicitly partial; it cannot be reconstructed
+from the live ring or inferred from HTTP success alone. `request.completed`
+means response headers were produced, while sync download completion records
+actual body consumption by HTTP, not remote receipt or client fsync.

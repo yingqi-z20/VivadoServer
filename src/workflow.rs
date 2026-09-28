@@ -200,6 +200,24 @@ impl WorkflowManager {
         T: Send + 'static,
         F: Future<Output = Result<T, AppError>> + Send + 'static,
     {
+        let history = self.0.config.history.clone();
+        let mut context = crate::history::context();
+        context.workflow_id = Some(id);
+        let requested = crate::history::Event::new(
+            "operation.requested",
+            Some(id),
+            None,
+            None,
+            serde_json::json!({"operation":operation}),
+        );
+        if matches!(
+            operation,
+            "workflow_create" | "workflow_push_plan" | "workflow_commit" | "workflow_start_session"
+        ) {
+            history.critical(vec![requested]).await?;
+        } else {
+            history.record(requested);
+        }
         let task = {
             let registry = self.0.registry.lock().expect("workflow registry poisoned");
             if registry.stopping {
@@ -208,11 +226,26 @@ impl WorkflowManager {
             let manager = self.clone();
             let span = tracing::info_span!("workflow_operation", operation, workflow_id = %id);
             self.0.tasks.spawn(
-                async move {
+                crate::history::scoped(context.clone(), async move {
                     // This supervisor belongs to the manager, so dropping the HTTP
                     // waiter cannot hide a worker panic or abandon its cleanup.
-                    match tokio::spawn(future.in_current_span()).await {
-                        Ok(result) => result,
+                    match tokio::spawn(crate::history::scoped(context, future.in_current_span()))
+                        .await
+                    {
+                        Ok(result) => {
+                            history.record(crate::history::Event::new(
+                                "operation.completed",
+                                Some(id),
+                                None,
+                                None,
+                                serde_json::json!({
+                                    "operation":operation,
+                                    "outcome":if result.is_ok(){"success"}else{"error"},
+                                    "error_code":result.as_ref().err().map(|e|e.code()),
+                                }),
+                            ));
+                            result
+                        }
                         Err(error) => {
                             manager.0.config.telemetry.task_failed(operation);
                             tracing::error!(%error, "managed workflow task failed");
@@ -222,7 +255,7 @@ impl WorkflowManager {
                             Err(error)
                         }
                     }
-                }
+                })
                 .instrument(span),
             )
         };
@@ -271,6 +304,13 @@ impl WorkflowManager {
         tracing::info!(workflow_id = %data.info.workflow_id, project = %data.info.project,
             previous_status = previous.label(), status = next.label(),
             phase_duration_ms = duration.as_millis() as u64, "workflow phase changed");
+        self.0.config.history.record(crate::history::Event::new(
+            "workflow.transition",
+            Some(data.info.workflow_id),
+            data.info.session_id,
+            Some(&data.info.project),
+            serde_json::json!({"previous_status":previous.label(),"status":next.label()}),
+        ));
         data.info.status = next;
         data.phase_started = Instant::now();
     }
@@ -410,6 +450,13 @@ impl WorkflowManager {
                     drop(activity);
                     return Self::wait_initialized(&existing).await;
                 }
+                manager.0.config.history.record(crate::history::Event::new(
+                    "workflow.created",
+                    Some(id),
+                    None,
+                    Some(&request.project),
+                    serde_json::json!({"reset_project":request.reset_project}),
+                ));
                 manager.0.config.telemetry.add_active("workflow", 1);
                 manager
                     .0
@@ -803,10 +850,10 @@ impl WorkflowManager {
             let result = manager
                 .0
                 .sessions
-                .create_session(CreateSessionRequest {
+                .create_session_with_workflow(CreateSessionRequest {
                     project: info.project,
                     args: request.args,
-                })
+                },Some(id))
                 .await;
             match result {
                 Ok(session) => {
@@ -1320,6 +1367,7 @@ impl WorkflowManager {
             status.label(),
             data.started.elapsed(),
         );
+        self.0.config.history.record(crate::history::Event::new("workflow.completed",Some(data.info.workflow_id),data.info.session_id,Some(&data.info.project),serde_json::json!({"status":status.label(),"error_code":data.info.error_code,"requires_full_upload":requires_full_upload})));
         tracing::info!(workflow_id = %data.info.workflow_id, project = %data.info.project,
             session_id = ?data.info.session_id, status = status.label(),
             duration_ms = data.started.elapsed().as_millis() as u64, requires_full_upload,

@@ -13,6 +13,7 @@ use crate::{
         PushPlanRequest, PushPlanResponse, SyncSessionStatus, SyncStatusResponse, UploadResponse,
     },
     workflow::{CreateWorkflowRequest, StartSessionRequest, WorkflowInfo, WorkflowStatus},
+    workspace_read::{WorkspaceEntry, WorkspaceListing, WorkspacePreview},
 };
 use serde_json::{Value, json};
 use std::sync::OnceLock;
@@ -22,6 +23,9 @@ use utoipa::OpenApi;
 #[openapi(
     info(title = "VivadoServer API", version = "1.0.0"),
     components(schemas(
+        WorkspaceEntry,
+        WorkspaceListing,
+        WorkspacePreview,
         HealthResponse,
         ReadyResponse,
         ErrorBody,
@@ -62,6 +66,15 @@ pub(crate) fn document() -> Value {
         let mut document = serde_json::to_value(ApiSchema::openapi()).expect("OpenAPI schemas serialize");
         document["info"]["description"] = json!("Linux service for trusted clients. Exactly one workflow owns a project through preparing (push), running (Vivado), and pulling (download), then releases it through finish or cancellation. Create a workflow with a client-generated UUID; retry the same UUID and parameters to recover a lost response. An incomplete project requires reset_project=true and a complete upload before Vivado can start. Bearer-token holders can execute commands as the service account through Tcl.");
         document["components"]["securitySchemes"] = json!({"bearerAuth": {"type": "http", "scheme": "bearer"}});
+        document["components"]["schemas"]["HistoryEvent"] = json!({"type":"object","required":["seq","instance_id","timestamp","event","data"],"properties":{
+            "seq":{"type":"integer","minimum":1},"instance_id":{"type":"string","format":"uuid"},"timestamp":{"type":"string","format":"date-time"},"event":{"type":"string"},
+            "workflow_id":{"type":"string","format":"uuid"},"session_id":{"type":"string","format":"uuid"},"project":{"type":"string"},"request_id":{"type":"string","format":"uuid"},"data":{"type":"object","additionalProperties":true}
+        }});
+        document["components"]["schemas"]["HistoryGap"] = json!({"type":"object","required":["after_seq","through_seq","reason"],"properties":{"after_seq":{"type":"integer","minimum":0},"through_seq":{"type":"integer","minimum":0},"reason":{"type":"string"}}});
+        document["components"]["schemas"]["HistoryPage"] = json!({"type":"object","description":"Private durable history. next_cursor is this page cursor; head_cursor is the committed journal head. Never exposed through the public native gateway.","required":["journal_id","instance_id","events","next_cursor","head_cursor","earliest_cursor","has_more","gaps","recording_state"],"properties":{
+            "journal_id":{"type":"string","format":"uuid"},"instance_id":{"type":"string","format":"uuid"},"events":{"type":"array","maxItems":256,"items":{"$ref":"#/components/schemas/HistoryEvent"}},
+            "next_cursor":{"type":"integer","minimum":0},"head_cursor":{"type":"integer","minimum":0},"earliest_cursor":{"type":"integer","minimum":0},"has_more":{"type":"boolean"},"gaps":{"type":"array","items":{"$ref":"#/components/schemas/HistoryGap"}},"recording_state":{"type":"string","enum":["recording","partial","unavailable"]}
+        }});
         document["paths"] = paths();
         document
     }).clone()
@@ -69,6 +82,15 @@ pub(crate) fn document() -> Value {
 
 fn paths() -> Value {
     let mut paths = json!({
+        "/internal/history/v1/events": {"get": {
+            "summary": "Read committed private history events",
+            "security": [{"bearerAuth":[]}],
+            "responses": response_set("HistoryPage"),
+            "parameters": [
+                {"name":"after","in":"query","schema":{"type":"integer","minimum":0,"default":0}},
+                {"name":"limit","in":"query","schema":{"type":"integer","minimum":1,"maximum":256,"default":256}}
+            ]
+        }},
         "/healthz": {"get": public_operation("Process health", "HealthResponse")},
         "/readyz": {"get": public_operation("Readiness; 503 while stopping or degraded", "ReadyResponse")},
         "/metrics": {"get": {
@@ -90,6 +112,18 @@ fn paths() -> Value {
                 "405": error_response("Method not allowed", true)
             }
         }},
+        "/v1/projects/{project}/workspace": {
+            "get": operation("List a runtime workspace directory", "Read-only single-level listing, including while Vivado is running. Paths are project-relative. Missing directories return exists=false. Links, devices, internal metadata and unrepresentable names are omitted. This is not an atomic snapshot.", None, "WorkspaceListing")
+        },
+        "/v1/projects/{project}/workspace-preview": {
+            "get": operation("Safely preview a runtime file", "Returns text only for UTF-8 without binary control characters, at most 1 MiB and 20000 lines. Other files return binary or too_large without text.", None, "WorkspacePreview")
+        },
+        "/v1/projects/{project}/workspace-file": {
+            "get": operation("Download any regular runtime workspace file", "Available independently of workflow phase. Response streams bytes, has attachment disposition, and reports x-workspace-snapshot: non-atomic. Stop Vivado first for stable results. Links and devices are rejected.", None, "WorkspaceListing")
+        },
+        "/v1/projects/{project}/workspace-archive": {
+            "get": operation("Download a runtime directory as ZIP", "Non-atomic snapshot, independent of workflow phase. Limited to 20000 entries, 2 GiB of file data and 120 seconds. ZIP is spooled on the runtime quota filesystem and removed when the response closes. A changing file causes 409; insufficient quota also causes 409. Unsupported names, links, devices and internal metadata are omitted. Only one ZIP can be built at a time; concurrent requests return 429.", None, "WorkspaceListing")
+        },
         "/v1/workflows/{workflow_id}": {
             "put": operation("Reserve the single workflow", "Create or retry the same workflow UUID and parameters. reset_project=true requires a complete push before starting Vivado; it is not an immediate standalone delete operation. A different active workflow returns 409 workflow_busy.", Some("CreateWorkflowRequest"), "WorkflowInfo"),
             "get": operation("Read workflow phase and cleanup status", "Observe preparing, running, pulling, stopping, or a terminal result. Terminal records are retained for a configured period.", None, "WorkflowInfo"),
@@ -166,12 +200,28 @@ fn paths() -> Value {
     download["responses"]["200"] =
         json!({"description": "File bytes", "headers": headers, "content": binary_content()});
 
+    for endpoint in [
+        "workspace",
+        "workspace-preview",
+        "workspace-file",
+        "workspace-archive",
+    ] {
+        let operation = &mut paths[format!("/v1/projects/{{project}}/{endpoint}")]["get"];
+        operation["parameters"] = json!([
+            {"name": "path", "in": "query", "required": matches!(endpoint, "workspace-preview" | "workspace-file"), "description": "Project-relative slash-separated path. Empty means root for listing or ZIP. Parent traversal, absolute paths, symbolic links and .vivado-server are rejected.", "schema": {"type": "string", "default": ""}}
+        ]);
+        if matches!(endpoint, "workspace-file" | "workspace-archive") {
+            operation["responses"]["200"] = json!({"description": "File bytes; non-atomic workspace snapshot", "headers": {"Content-Disposition": {"schema": {"type": "string"}}, "Content-Length": {"schema": {"type": "integer"}}, "x-workspace-snapshot": {"schema": {"type": "string", "enum": ["non-atomic"]}}}, "content": binary_content()});
+            operation["responses"]["200"]["headers"]["x-request-id"] =
+                request_id_headers()["x-request-id"].clone();
+        }
+    }
     for (path, item) in paths.as_object_mut().expect("paths is an object") {
         let mut parameters = Vec::new();
-        for name in ["workflow_id", "sync_id", "path"] {
+        for name in ["workflow_id", "sync_id", "path", "project"] {
             if path.contains(&format!("{{{name}}}")) {
                 let mut schema = json!({"type": "string"});
-                if name != "path" {
+                if name != "path" && name != "project" {
                     schema["format"] = json!("uuid");
                 }
                 let mut parameter =
@@ -305,7 +355,9 @@ mod tests {
         for declaration in include_str!("api.rs").split(".route(").skip(1) {
             let declaration = declaration.trim_start().strip_prefix('"').unwrap();
             let (path, rest) = declaration.split_once('"').unwrap();
-            let path = if ["/healthz", "/readyz", "/openapi.json", "/metrics"].contains(&path) {
+            let path = if path.starts_with("/internal/")
+                || ["/healthz", "/readyz", "/openapi.json", "/metrics"].contains(&path)
+            {
                 path.to_string()
             } else {
                 format!("/v1{path}")
@@ -337,7 +389,30 @@ mod tests {
         let document = document();
         assert_eq!(operations(&document), expected);
         assert!(!document.to_string().contains("/v1/sessions"));
-        assert!(!document.to_string().contains("/v1/projects"));
+        // Project access is limited to the explicitly introduced read-only
+        // workspace views. Standalone project mutation/session/sync routes
+        // remain absent; workflow ownership still gates every write.
+        let project_operations: BTreeSet<_> = operations(&document)
+            .into_iter()
+            .filter(|(path, _)| path.starts_with("/v1/projects"))
+            .collect();
+        let expected_project_operations: BTreeSet<_> = [
+            "workspace",
+            "workspace-preview",
+            "workspace-file",
+            "workspace-archive",
+        ]
+        .into_iter()
+        .flat_map(|endpoint| {
+            ["get", "head"].into_iter().map(move |method| {
+                (
+                    format!("/v1/projects/{{project}}/{endpoint}"),
+                    method.to_string(),
+                )
+            })
+        })
+        .collect();
+        assert_eq!(project_operations, expected_project_operations);
         assert!(
             document["components"]["schemas"]
                 .get("RuntimeConfig")
@@ -355,7 +430,7 @@ mod tests {
         let document = document();
         for (path, method) in operations(&document) {
             let operation = &document["paths"][&path][&method];
-            if path.starts_with("/v1/") {
+            if path.starts_with("/v1/") || path.starts_with("/internal/") {
                 assert_eq!(operation["security"], json!([{"bearerAuth": []}]));
                 for status in [
                     "400", "401", "404", "405", "408", "409", "412", "413", "429", "500", "503",
@@ -485,7 +560,7 @@ mod tests {
         }
         check_refs(&document, &document);
         for (path, item) in document["paths"].as_object().unwrap() {
-            for name in ["workflow_id", "sync_id", "path"] {
+            for name in ["workflow_id", "sync_id", "path", "project"] {
                 if path.contains(&format!("{{{name}}}")) {
                     let parameter = item["parameters"]
                         .as_array()
@@ -495,10 +570,36 @@ mod tests {
                         .unwrap();
                     assert_eq!(parameter["in"], "path");
                     assert_eq!(parameter["required"], true);
-                    if name != "path" {
+                    assert_eq!(parameter["schema"]["type"], "string");
+                    if name != "path" && name != "project" {
                         assert_eq!(parameter["schema"]["format"], "uuid");
+                    } else {
+                        assert!(parameter["schema"].get("format").is_none());
                     }
                 }
+            }
+        }
+        for endpoint in [
+            "workspace",
+            "workspace-preview",
+            "workspace-file",
+            "workspace-archive",
+        ] {
+            let item = &document["paths"][format!("/v1/projects/{{project}}/{endpoint}")];
+            assert_eq!(item["parameters"].as_array().unwrap().len(), 1);
+            assert_eq!(item["parameters"][0]["name"], "project");
+            for method in ["get", "head"] {
+                let operation = &item[method];
+                assert!(operation.get("requestBody").is_none());
+                let query = &operation["parameters"][0];
+                assert_eq!(operation["parameters"].as_array().unwrap().len(), 1);
+                assert_eq!(query["name"], "path");
+                assert_eq!(query["in"], "query");
+                assert_eq!(query["schema"]["type"], "string");
+                assert_eq!(
+                    query["required"],
+                    matches!(endpoint, "workspace-preview" | "workspace-file")
+                );
             }
         }
         for (path, method, request, response) in [

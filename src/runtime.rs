@@ -34,14 +34,25 @@ pub struct AppRuntime {
 
 impl AppRuntime {
     pub async fn initialize(config: AppConfig) -> anyhow::Result<Self> {
-        let (config, auth) = config.into_runtime()?;
+        let (mut config, auth) = config.into_runtime()?;
         let projects = ProjectStore::initialize(config.workspace_root.clone()).await?;
-        let sync = SyncManager::new(config.clone());
         // The instance lock is held before deleting any abandoned staging.
-        sync.cleanup_orphans()
+        SyncManager::new(config.clone())
+            .cleanup_orphans()
             .await
             .context("failed to clean abandoned sync staging")?;
-        let diagnostics = Diagnostics::initialize(&config, projects.clone()).await?;
+        config.history = crate::history::History::initialize(
+            config.workspace_root.clone(),
+            config.history_options.clone(),
+            projects.clone(),
+        )
+        .await?;
+        let sync = SyncManager::new(config.clone());
+        let diagnostics = if config.history.enabled() {
+            Diagnostics::disabled()
+        } else {
+            Diagnostics::initialize(&config, projects.clone()).await?
+        };
         let sessions = SessionManager::new_with_diagnostics(config.clone(), diagnostics.clone());
         let cancellation = CancellationToken::new();
         let sync_reaper = sync.spawn_session_reaper(cancellation.child_token());
@@ -96,6 +107,10 @@ impl AppRuntime {
             .config
             .telemetry
             .attach_log_error_counter(logging.counter.clone());
+        self.services
+            .config
+            .telemetry
+            .attach_log_file_error_counter(logging.file_failures.clone());
     }
 
     pub async fn shutdown(&self) {
@@ -135,6 +150,7 @@ impl AppRuntime {
             );
         }
         self.diagnostics.shutdown().await;
+        self.services.config.history.shutdown().await;
         let outcome = if drained { "success" } else { "timeout" };
         self.services
             .config
@@ -157,9 +173,11 @@ impl Drop for AppRuntime {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let workflows = self.services.workflows.clone();
             let diagnostics = self.diagnostics.clone();
+            let history = self.services.config.history.clone();
             handle.spawn(async move {
                 workflows.shutdown().await;
                 diagnostics.shutdown().await;
+                history.shutdown().await;
             });
         }
     }

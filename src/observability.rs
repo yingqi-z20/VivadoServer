@@ -57,6 +57,8 @@ pub(crate) struct Observability {
     started: Instant,
     log_dropped: IntGauge,
     log_counter: Arc<Mutex<Option<tracing_appender::non_blocking::ErrorCounter>>>,
+    log_file_failures: IntGauge,
+    log_file_counter: Arc<Mutex<Option<Arc<std::sync::atomic::AtomicU64>>>>,
 }
 
 impl std::fmt::Debug for Observability {
@@ -172,6 +174,10 @@ impl Observability {
             "log_dropped_messages",
             "Log messages dropped by the bounded asynchronous log writer since startup."
         ));
+        let log_file_failures = register!(IntGauge::new(
+            "log_file_write_failures",
+            "Service log file write, flush, or retention failures since logging initialization."
+        ));
         let build_info = register!(IntGaugeVec::new(
             Opts::new("build_info", "Build identity; value is always one."),
             &["version"]
@@ -210,6 +216,8 @@ impl Observability {
             started: Instant::now(),
             log_dropped,
             log_counter: Arc::new(Mutex::new(None)),
+            log_file_failures,
+            log_file_counter: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -274,7 +282,26 @@ impl Observability {
             self.log_dropped
                 .set(counter.dropped_lines().min(i64::MAX as usize) as i64);
         }
+        if let Some(counter) = self
+            .log_file_counter
+            .lock()
+            .expect("log file counter lock poisoned")
+            .as_ref()
+        {
+            self.log_file_failures.set(
+                counter
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    .min(i64::MAX as u64) as i64,
+            );
+        }
         TextEncoder::new().encode_to_string(&self.registry.gather())
+    }
+
+    pub(crate) fn attach_log_file_error_counter(&self, counter: Arc<std::sync::atomic::AtomicU64>) {
+        *self
+            .log_file_counter
+            .lock()
+            .expect("log file counter lock poisoned") = Some(counter);
     }
 
     pub(crate) fn request_started(

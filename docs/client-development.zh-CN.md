@@ -264,3 +264,28 @@ HTTP 取消不会撤销已接受的状态变更，重连后查询权威状态。
 Bearer 权限允许通过 Tcl `exec` 以服务账号身份执行系统命令。使用专用账号、可信源码及内网/VPN，并由 TLS 或可信 HTTPS 边界保护传输。服务不提供浏览器 CORS 或代码执行沙箱。
 
 同步结果最多保留 `sync_result_retention_secs`，全服务同时最多保留 128 个已完成结果，因此旧结果可能在时间上限之前返回 404。每个工作流最多保留最近 128 个计划的引用。客户端应自行保存需要留存的结果，不将服务端查询接口作为审计归档。
+
+## 运行工作区只读访问
+
+使用现有 Bearer 鉴权，可在 Vivado 运行期间、工作流开始前或结束后浏览和下载
+当前容器内的工程文件。以下接口独立于同步协议，原有 preparing/running/pulling
+阶段约束保持不变。
+
+| 方法和路径 | 返回内容 |
+| --- | --- |
+| `GET /v1/projects/{project}/workspace?path=` | 单层目录：`path`、`exists` 和 `entries`；条目包含 `path`、`name`、`kind`（`file`/`dir`）、`size_bytes`、`mtime_unix_ms`。空 `path` 表示工程根目录；目录不存在时 `exists: false`。 |
+| `GET /v1/projects/{project}/workspace-preview?path=...` | JSON：`kind`（`text`、`binary`、`too_large`）、`size_bytes` 和可选 `text`/`reason`。最多预览 1 MiB、20000 行，要求严格 UTF-8 且不含二进制控制字符。 |
+| `GET /v1/projects/{project}/workspace-file?path=...` | 流式返回普通文件原始字节，采用附件下载；不受文本预览或 ZIP 大小限制。 |
+| `GET /v1/projects/{project}/workspace-archive?path=` | 将选定目录打包为 ZIP，包内路径相对此目录；保留空目录。 |
+
+请使用 HTTP 客户端的查询参数编码器传递 `path`。路径始终相对于选定工程根目录，
+拒绝绝对路径、父目录穿越、链接、设备及 `.vivado-server` 内部元数据。目录浏览和
+ZIP 跳过不支持的条目和内部元数据。运行工作区允许 `:`、`?` 等 Linux 文件名字符，
+因此不受同步 API 的跨平台文件名限制。
+
+读取和归档**不是原子快照**。下载响应包含 `x-workspace-snapshot: non-atomic`；
+如需稳定结果，请先停止 Vivado。预览或 ZIP 生成中检测到文件变化时返回 `409`。
+ZIP 最多包含 20000 项、2 GiB 文件数据，生成时限 120 秒；临时内容保存在受用户
+配额限制的运行文件系统匿名文件中，下载结束或连接关闭后释放。配额不足返回 `409`，
+超出大小或条目数返回 `413`，已有另一个 ZIP 正在生成时返回 `429`。剩余配额不足以
+生成归档时，可分别下载所需文件。

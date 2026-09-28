@@ -264,3 +264,33 @@ HTTP cancellation does not undo an accepted state change. Query authoritative st
 Bearer access permits Tcl `exec` as the service identity. Use a dedicated account, trusted sources, and an internal/VPN network with TLS or a trusted HTTPS boundary. Browser CORS and execution sandboxing are not provided.
 
 Sync results are retained for `sync_result_retention_secs`, with at most 128 settled results across the service. Old results can therefore return 404 before the time limit. A workflow retains references to at most its 128 newest plans. Persist results needed by the client instead of using the service as an audit archive.
+
+## Read-only runtime workspace access
+
+A bearer-authenticated client may browse and download its container's project
+workspace while Vivado is running, before starting a workflow, or after finishing
+one. These endpoints are independent of the sync protocol; the existing
+preparing/running/pulling rules are unchanged.
+
+| Method and path | Result |
+| --- | --- |
+| `GET /v1/projects/{project}/workspace?path=` | One directory level: `path`, `exists`, and `entries` with `path`, `name`, `kind` (`file`/`dir`), `size_bytes`, `mtime_unix_ms`. Empty `path` selects the project root; a missing directory returns `exists: false`. |
+| `GET /v1/projects/{project}/workspace-preview?path=...` | JSON with `kind` (`text`, `binary`, `too_large`), `size_bytes`, and optional `text`/`reason`. Preview is limited to 1 MiB and 20000 lines, strict UTF-8, and no binary control characters. |
+| `GET /v1/projects/{project}/workspace-file?path=...` | Streamed regular file bytes with attachment disposition; not limited by the preview or ZIP size limits. |
+| `GET /v1/projects/{project}/workspace-archive?path=` | ZIP of the selected directory, with paths relative to that directory. Empty directories are included. |
+
+Encode the `path` query parameter using the HTTP client's query encoder. Paths are
+relative to the selected project root. Absolute paths, parent traversal, links,
+devices, and `.vivado-server` are rejected. Listings and ZIPs skip unsupported
+entries and internal metadata. Linux runtime filenames may contain characters
+such as `:` or `?` that the synchronization API does not support.
+
+Reads and archives are **not atomic snapshots**. Download responses include
+`x-workspace-snapshot: non-atomic`; stop Vivado first when stable results matter.
+A detected file change during preview/ZIP construction returns `409`. ZIP
+construction is limited to 20000 entries, 2 GiB of file contents, and 120 seconds;
+it uses an anonymous temporary file on the quota-controlled runtime filesystem.
+Insufficient quota returns `409`, exceeded size/count limits return `413`, and a
+concurrent ZIP construction returns `429`. The temporary file is released when
+the download closes. Download individual files when there is insufficient free
+workspace quota to construct an archive.

@@ -44,6 +44,8 @@ pub struct AppConfig {
     pub shutdown_grace_secs: u64,
     pub max_in_flight_requests: usize,
     pub observability: ObservabilityConfig,
+    #[serde(default)]
+    pub history: crate::history::HistoryConfig,
     pub tls: Option<TlsConfig>,
 }
 
@@ -74,6 +76,7 @@ impl Default for AppConfig {
             shutdown_grace_secs: 15,
             max_in_flight_requests: 64,
             observability: ObservabilityConfig::default(),
+            history: crate::history::HistoryConfig::default(),
             tls: None,
         }
     }
@@ -120,6 +123,8 @@ pub struct RuntimeConfig {
     pub shutdown_grace_secs: u64,
     pub max_in_flight_requests: usize,
     pub observability: ObservabilityConfig,
+    pub history_options: crate::history::HistoryConfig,
+    pub(crate) history: crate::history::History,
     pub(crate) telemetry: crate::observability::Observability,
     pub tls: Option<TlsConfig>,
 }
@@ -264,6 +269,8 @@ impl AppConfig {
             shutdown_grace_secs: self.shutdown_grace_secs,
             max_in_flight_requests: self.max_in_flight_requests,
             observability: self.observability,
+            history_options: self.history,
+            history: crate::history::History::default(),
             telemetry: crate::observability::Observability::new(),
             tls: self.tls,
         };
@@ -284,6 +291,7 @@ impl AppConfig {
 
     fn validate_settings(&mut self) -> anyhow::Result<()> {
         self.observability.validate()?;
+        self.history.validate()?;
         let addr: SocketAddr = self
             .listen_addr
             .parse()

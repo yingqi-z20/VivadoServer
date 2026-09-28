@@ -5,6 +5,7 @@ use crate::{
     session::{OutputQuery, SendInputRequest},
     sync::{CommitSyncRequest, ManifestRequest, PullPlanRequest, PushPlanRequest},
     workflow::{CreateWorkflowRequest, StartSessionRequest},
+    workspace_read::{self, WorkspaceListing, WorkspacePreview, WorkspaceQuery},
 };
 use axum::{
     Json, Router,
@@ -115,6 +116,16 @@ pub(crate) fn build_router(services: AppServices) -> Router {
         },
     };
     let protected = Router::new()
+        .route("/projects/{project}/workspace", get(workspace_list))
+        .route("/projects/{project}/workspace-file", get(workspace_file))
+        .route(
+            "/projects/{project}/workspace-preview",
+            get(workspace_preview),
+        )
+        .route(
+            "/projects/{project}/workspace-archive",
+            get(workspace_archive),
+        )
         .route(
             "/workflows/{workflow_id}",
             put(create_workflow)
@@ -159,7 +170,11 @@ pub(crate) fn build_router(services: AppServices) -> Router {
         )
         .fallback(api_not_found)
         .layer(axum::extract::DefaultBodyLimit::disable())
-        .layer(middleware::from_fn_with_state(budget, admission))
+        .layer(middleware::from_fn_with_state(budget.clone(), admission))
+        .layer(middleware::from_fn_with_state(
+            services.config.history.clone(),
+            journal_request,
+        ))
         .layer(middleware::from_fn_with_state(
             services.auth.clone(),
             require_auth,
@@ -171,12 +186,20 @@ pub(crate) fn build_router(services: AppServices) -> Router {
                 services.auth.clone(),
                 require_auth,
             ));
+    let history = Router::new()
+        .route("/internal/history/v1/events", get(history_events))
+        .layer(middleware::from_fn_with_state(budget, admission))
+        .layer(middleware::from_fn_with_state(
+            services.auth.clone(),
+            require_auth,
+        ));
     let telemetry = services.config.telemetry.clone();
     let mut router = Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/openapi.json", get(openapi_json))
         .nest("/v1", protected)
+        .merge(history)
         .fallback(api_not_found);
     if services.config.observability.metrics_enabled {
         router = router.merge(metrics);
@@ -194,7 +217,10 @@ async fn admission(State(budget): State<HttpBudget>, mut request: Request, next:
         .unwrap_or(request.uri().path());
     let method = request.method();
     let control = method == Method::DELETE
-        || (method == Method::GET && !path.ends_with("/output") && !path.contains("/sync/files/"))
+        || (method == Method::GET
+            && !path.ends_with("/output")
+            && !path.contains("/sync/files/")
+            && !path.contains("/workspace"))
         || (method == Method::POST && (path.ends_with("/heartbeat") || path.ends_with("/finish")));
     let semaphore = if control { budget.control } else { budget.data };
     let permit = match semaphore.try_acquire_owned() {
@@ -211,6 +237,37 @@ async fn admission(State(budget): State<HttpBudget>, mut request: Request, next:
         .cloned();
     let (parts, body) = response.into_parts();
     Response::from_parts(parts, crate::body::hold(body, permit, cancel))
+}
+
+// Record authenticated operation metadata even when JSON/path validation rejects
+// the request. Bodies, query strings and arbitrary paths are never service logs.
+async fn journal_request(
+    State(history): State<crate::history::History>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let method = request.method().as_str().to_owned();
+    let route = metric_route(
+        request
+            .extensions()
+            .get::<MatchedPath>()
+            .map(MatchedPath::as_str),
+    );
+    let record = method != "GET" && method != "HEAD"
+        || route.contains("/files/")
+        || route.ends_with("workspace-file")
+        || route.ends_with("workspace-archive");
+    let response = next.run(request).await;
+    if record {
+        history.record(crate::history::Event::new(
+            "request.completed",
+            None,
+            None,
+            None,
+            serde_json::json!({"method":method,"route":route,"status":response.status().as_u16(),"outcome":"headers_sent"}),
+        ));
+    }
+    response
 }
 
 async fn request_context(
@@ -263,10 +320,34 @@ async fn request_context(
     }
     let mut observation =
         telemetry.request_started(method, route, request_id.clone(), span.clone());
-    let response = async {
+    let context = crate::history::Context {
+        request_id: Uuid::parse_str(&request_id).ok(),
+        sync_id: request
+            .extensions()
+            .get::<OriginalUri>()
+            .map(|uri| uri.0.path())
+            .unwrap_or(request.uri().path())
+            .split('/')
+            .nth(5)
+            .and_then(|v| Uuid::parse_str(v).ok()),
+        workflow_id: request
+            .extensions()
+            .get::<OriginalUri>()
+            .map(|uri| uri.0.path())
+            .unwrap_or(request.uri().path())
+            .split('/')
+            .nth(3)
+            .and_then(|v| Uuid::parse_str(v).ok()),
+        parent_request_id: request
+            .headers()
+            .get("x-platform-request-id")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| Uuid::parse_str(v).ok()),
+    };
+    let response = crate::history::scoped(context, async {
         let response = next.run(request).await;
         normalize_response(response, &request_id).await
-    }
+    })
     .instrument(span)
     .await;
     observation.headers(
@@ -306,6 +387,15 @@ fn metric_route(matched: Option<&str>) -> &'static str {
         Some("/readyz") => "/readyz",
         Some("/metrics") => "/metrics",
         Some("/openapi.json") => "/openapi.json",
+        Some("/internal/history/v1/events") => "/internal/history/v1/events",
+        Some("/v1/projects/{project}/workspace") => "/v1/projects/{project}/workspace",
+        Some("/v1/projects/{project}/workspace-file") => "/v1/projects/{project}/workspace-file",
+        Some("/v1/projects/{project}/workspace-preview") => {
+            "/v1/projects/{project}/workspace-preview"
+        }
+        Some("/v1/projects/{project}/workspace-archive") => {
+            "/v1/projects/{project}/workspace-archive"
+        }
         Some("/v1/workflows/{workflow_id}") => "/v1/workflows/{workflow_id}",
         Some("/v1/workflows/{workflow_id}/heartbeat") => "/v1/workflows/{workflow_id}/heartbeat",
         Some("/v1/workflows/{workflow_id}/finish") => "/v1/workflows/{workflow_id}/finish",
@@ -714,4 +804,81 @@ async fn sync_download_file(
             .download(path.workflow_id, path.path, if_match)
             .await
     }
+}
+
+async fn workspace_list(
+    State(services): State<AppServices>,
+    Path(project): Path<String>,
+    query: Result<Query<WorkspaceQuery>, axum::extract::rejection::QueryRejection>,
+) -> Result<Json<WorkspaceListing>, AppError> {
+    let Query(query) = query.map_err(|error| AppError::BadRequest(error.to_string()))?;
+    let root = services.config.workspace_root.clone();
+    tokio::task::spawn_blocking(move || workspace_read::list(&root, &project, &query.path))
+        .await
+        .map_err(|error| AppError::Internal(format!("workspace list task failed: {error}")))?
+        .map(Json)
+}
+async fn workspace_preview(
+    State(services): State<AppServices>,
+    Path(project): Path<String>,
+    query: Result<Query<WorkspaceQuery>, axum::extract::rejection::QueryRejection>,
+) -> Result<Json<WorkspacePreview>, AppError> {
+    let Query(query) = query.map_err(|error| AppError::BadRequest(error.to_string()))?;
+    let root = services.config.workspace_root.clone();
+    tokio::task::spawn_blocking(move || workspace_read::preview(&root, &project, &query.path))
+        .await
+        .map_err(|error| AppError::Internal(format!("workspace preview task failed: {error}")))?
+        .map(Json)
+}
+async fn workspace_file(
+    State(services): State<AppServices>,
+    Path(project): Path<String>,
+    query: Result<Query<WorkspaceQuery>, axum::extract::rejection::QueryRejection>,
+) -> Result<Response, AppError> {
+    let Query(query) = query.map_err(|error| AppError::BadRequest(error.to_string()))?;
+    let root = services.config.workspace_root.clone();
+    let name = query
+        .path
+        .rsplit('/')
+        .next()
+        .unwrap_or("download")
+        .to_string();
+    let (file, size) =
+        tokio::task::spawn_blocking(move || workspace_read::download(&root, &project, &query.path))
+            .await
+            .map_err(|error| {
+                AppError::Internal(format!("workspace download task failed: {error}"))
+            })??;
+    Ok(workspace_read::file_response(file, size, &name, false))
+}
+async fn workspace_archive(
+    State(services): State<AppServices>,
+    Path(project): Path<String>,
+    query: Result<Query<WorkspaceQuery>, axum::extract::rejection::QueryRejection>,
+) -> Result<Response, AppError> {
+    let Query(query) = query.map_err(|error| AppError::BadRequest(error.to_string()))?;
+    let name = format!(
+        "{}.zip",
+        query
+            .path
+            .rsplit('/')
+            .find(|part| !part.is_empty())
+            .unwrap_or(&project)
+    );
+    let (file, size) =
+        workspace_read::archive(services.config.workspace_root.clone(), project, query.path)
+            .await?;
+    Ok(workspace_read::file_response(file, size, &name, true))
+}
+
+async fn history_events(
+    State(services): State<AppServices>,
+    query: Result<Query<crate::history::Query>, axum::extract::rejection::QueryRejection>,
+) -> Result<Response, AppError> {
+    let Query(query) = query.map_err(|e| AppError::BadRequest(e.to_string()))?;
+    let page = services
+        .config
+        .history
+        .page(query.after, query.limit.unwrap_or(256))?;
+    Ok(([(header::CACHE_CONTROL, "no-store")], Json(page)).into_response())
 }

@@ -153,6 +153,13 @@ pub(super) async fn run(
         }
     };
     session.pid.store(process.pid, Ordering::Release);
+    session.history.record(crate::history::Event::new(
+        "session.process_started",
+        session.workflow_id,
+        Some(session.id),
+        Some(&session.project),
+        serde_json::json!({"pid":process.pid}),
+    ));
     tracing::info!(event = "session_process_started", session_id = %session.id, project = %session.project, pid = process.pid, "Vivado process started");
     let mut started = Some(started);
     let mut startup_error = None;
@@ -295,6 +302,7 @@ async fn supervise(
                     if input.offset == input.bytes.len()
                         && let Some(input) = pending.take()
                     {
+                        input.record_completion("written");
                         let _ = input.completion.send(Ok(()));
                     }
                 }
@@ -303,6 +311,7 @@ async fn supervise(
                 tracing::warn!(event = "session_input_write_failed", session_id = %session.id, project = %session.project, pid = process.pid, %error, "PTY input failed");
                 session.telemetry.event("session_input", "write_failed");
                 if let Some(input) = pending.take() {
+                    input.record_completion("write_failed");
                     let _ = input.completion.send(Err(AppError::Internal(format!(
                         "PTY input failed: {error}"
                     ))));
@@ -486,9 +495,11 @@ async fn supervise(
 fn reject_inputs(receiver: &mut mpsc::Receiver<Input>, pending: &mut Option<Input>) {
     receiver.close();
     if let Some(input) = pending.take() {
+        input.record_completion("interrupted");
         let _ = input.completion.send(Err(AppError::SessionNotRunning));
     }
     while let Ok(input) = receiver.try_recv() {
+        input.record_completion("interrupted");
         let _ = input.completion.send(Err(AppError::SessionNotRunning));
     }
 }

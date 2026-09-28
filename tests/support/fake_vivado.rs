@@ -57,6 +57,10 @@ fn main() {
                 io::stdout().flush().unwrap();
                 process::exit(exit_code);
             }
+        } else if let Some(size) = text.strip_prefix("burst ") {
+            let size = size.parse::<usize>().unwrap().min(4 * 1024 * 1024);
+            io::stdout().write_all(&vec![b'x'; size]).unwrap();
+            println!();
         } else if let Some(arguments) = text.strip_prefix("write ") {
             let (path, contents) = arguments.split_once(' ').unwrap();
             if let Some(parent) = std::path::Path::new(path).parent() {

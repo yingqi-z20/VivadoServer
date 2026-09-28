@@ -53,6 +53,8 @@ struct ManagerState {
 
 struct Session {
     id: Uuid,
+    workflow_id: Option<Uuid>,
+    history: crate::history::History,
     project: String,
     pid: AtomicI32,
     started: Instant,
@@ -76,10 +78,34 @@ struct SessionData {
 }
 
 struct Input {
+    context: crate::history::Context,
+    id: Uuid,
+    session_id: Uuid,
+    workflow_id: Option<Uuid>,
+    project: String,
+    history: crate::history::History,
     bytes: Vec<u8>,
     offset: usize,
     completion: oneshot::Sender<Result<(), AppError>>,
     _budget: OwnedSemaphorePermit,
+}
+
+impl Input {
+    fn record_completion(&self, outcome: &str) {
+        let event = crate::history::Event::new(
+            "session.stdin_complete",
+            self.workflow_id,
+            Some(self.session_id),
+            Some(&self.project),
+            serde_json::json!({
+                "input_id":self.id,
+                "written_bytes":self.offset,
+                "outcome":outcome,
+            }),
+        )
+        .correlated(&self.context);
+        self.history.record(event);
+    }
 }
 
 impl SessionManager {
@@ -108,11 +134,32 @@ impl SessionManager {
         &self,
         request: CreateSessionRequest,
     ) -> Result<SessionInfo, AppError> {
+        self.create_session_with_workflow(request, None).await
+    }
+    pub(crate) async fn create_session_with_workflow(
+        &self,
+        request: CreateSessionRequest,
+        workflow_id: Option<Uuid>,
+    ) -> Result<SessionInfo, AppError> {
         validate_vivado_args(&request.args)?;
         let id = Uuid::new_v4();
+        self.shared
+            .config
+            .history
+            .critical(vec![crate::history::Event::new(
+                "session.start_requested",
+                workflow_id,
+                Some(id),
+                Some(&request.project),
+                serde_json::json!({}),
+            )])
+            .await?;
+        let context = crate::history::context();
         let (inputs, receiver) = mpsc::channel(INPUT_QUEUE_LENGTH);
         let session = Arc::new(Session {
             id,
+            workflow_id,
+            history: self.shared.config.history.clone(),
             project: request.project.clone(),
             pid: AtomicI32::new(0),
             started: Instant::now(),
@@ -165,13 +212,20 @@ impl SessionManager {
             let span =
                 tracing::info_span!("vivado_session", session_id = %id, project = %request.project);
             self.shared.tasks.spawn(
-                async move {
+                crate::history::scoped(context, async move {
                     let info = session.snapshot().await;
                     *session.archive.lock().unwrap_or_else(|e| e.into_inner()) =
                         manager.diagnostics.start(&info);
+                    session.history.record(crate::history::Event::new(
+                        "session.started",
+                        session.workflow_id,
+                        Some(session.id),
+                        Some(&session.project),
+                        serde_json::json!({}),
+                    ));
                     tracing::info!("Vivado session accepted");
                     supervisor::run(manager, session, receiver, request, started).await;
-                }
+                })
                 .instrument(span),
             );
         }
@@ -220,20 +274,47 @@ impl SessionManager {
             .clone()
             .try_acquire_many_owned(count)
             .map_err(|_| AppError::Capacity("stdin queue byte budget is full".into()))?;
+        let input_id = Uuid::new_v4();
+        if session.history.enabled() {
+            let events = crate::history::History::text_events(
+                "session.stdin_intent",
+                session.workflow_id,
+                id,
+                &session.project,
+                &request.text,
+                serde_json::json!({"input_id":input_id,"byte_offset":0}),
+            );
+            session.history.critical(events).await?;
+        }
         let (completion, result) = oneshot::channel();
         session
             .inputs
             .try_send(Input {
+                context: crate::history::context(),
+                id: input_id,
+                session_id: id,
+                workflow_id: session.workflow_id,
+                project: session.project.clone(),
+                history: session.history.clone(),
                 bytes: request.text.into_bytes(),
                 offset: 0,
                 completion,
                 _budget: budget,
             })
-            .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => {
-                    AppError::Capacity("stdin queue is full".into())
+            .map_err(|error| {
+                session.history.record(crate::history::Event::new(
+                    "session.stdin_complete",
+                    session.workflow_id,
+                    Some(id),
+                    Some(&session.project),
+                    serde_json::json!({"input_id":input_id,"written_bytes":0,"outcome":"rejected"}),
+                ));
+                match error {
+                    mpsc::error::TrySendError::Full(_) => {
+                        AppError::Capacity("stdin queue is full".into())
+                    }
+                    mpsc::error::TrySendError::Closed(_) => AppError::SessionNotRunning,
                 }
-                mpsc::error::TrySendError::Closed(_) => AppError::SessionNotRunning,
             })?;
         result.await.map_err(|_| AppError::SessionNotRunning)??;
         Ok(session.snapshot().await)
@@ -407,8 +488,11 @@ impl Session {
         if text.is_empty() {
             return;
         }
-        self.output_bytes
+        let offset = self
+            .output_bytes
             .fetch_add(text.len() as u64, Ordering::Relaxed);
+        self.history
+            .output(self.workflow_id, self.id, &self.project, &text, offset);
         self.telemetry
             .add_bytes("session_output", text.len() as u64);
         if let Some(archive) = self
@@ -466,6 +550,7 @@ impl Session {
         data.info.cleanup_error = None;
         self.terminal.store(true, Ordering::Release);
         let info = data.info.clone();
+        self.history.record(crate::history::Event::new("session.finished",self.workflow_id,Some(self.id),Some(&self.project),serde_json::json!({"status":info.status,"exit_code":code,"termination_reason":reason,"output_truncated":truncated,"output_bytes":self.output_bytes.load(Ordering::Acquire)})));
         drop(data);
         self.changed.notify_waiters();
         self.telemetry.add_active("session", -1);
