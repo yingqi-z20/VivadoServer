@@ -721,10 +721,10 @@ impl History {
         }
         if events.len() < limit
             && reader
-               .events
-               .range((std::ops::Bound::Excluded(next), std::ops::Bound::Unbounded))
-               .next()
-               .is_none()
+                .events
+                .range((std::ops::Bound::Excluded(next), std::ops::Bound::Unbounded))
+                .next()
+                .is_none()
         {
             next = next.max(reader.state.next_cursor);
         }
