@@ -37,6 +37,21 @@ upload_deadline_secs = 14400
 shutdown_grace_secs = 15
 max_in_flight_requests = 64
 
+[observability]
+# JSON includes timestamps, levels, event fields, and request/workflow/session spans.
+# Use "text" for local development. RUST_LOG overrides log_filter.
+log_format = "json"
+log_filter = "vivado_server=info,tower_http=warn"
+# GET /metrics uses the same Bearer authentication as the workflow API.
+metrics_enabled = true
+# PTY output can contain project content. Archives are private files under
+# <workspace>/.vivado-server/diagnostics; they are separate from API retention.
+archive_output = true
+archive_max_bytes_per_session = 67108864
+archive_max_total_bytes = 536870912
+archive_retention_secs = 604800
+archive_max_sessions = 128
+
 # [tls]
 # cert_path = "secrets/server.crt"
 # key_path = "secrets/server.key"

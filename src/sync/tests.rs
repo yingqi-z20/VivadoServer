@@ -1,5 +1,261 @@
 use super::*;
 
+fn metric_value(manager: &SyncManager, name: &str, labels: &[&str]) -> f64 {
+    manager
+        .config
+        .telemetry
+        .render()
+        .unwrap()
+        .lines()
+        .find(|line| {
+            line.starts_with(&format!("vivado_server_{name}{{"))
+                && labels.iter().all(|label| line.contains(label))
+        })
+        .map(|line| line.rsplit_once(' ').unwrap().1.parse().unwrap())
+        .unwrap_or(0.0)
+}
+
+#[tokio::test]
+async fn sync_metrics_count_valid_uploads_and_transactions_once() {
+    let temp = tempfile::tempdir().unwrap();
+    let manager = SyncManager::new(test_config(temp.path()));
+    let plan = manager
+        .push_reset_plan(
+            "project".into(),
+            PushPlanRequest {
+                entries: vec![file_entry("top.v", b"good")],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        metric_value(&manager, "active", &["kind=\"sync_session\""]),
+        1.0
+    );
+    let invalid = manager
+        .upload_file(
+            "project".into(),
+            plan.sync_id,
+            "top.v".into(),
+            Some(4),
+            Body::from("oops"),
+        )
+        .await;
+    assert!(matches!(invalid, Err(AppError::BadRequest(_))));
+    assert_eq!(
+        metric_value(&manager, "bytes_total", &["kind=\"sync_upload\""]),
+        0.0
+    );
+    upload(&manager, plan.sync_id, "top.v", b"good").await;
+    for _ in 0..2 {
+        manager
+            .commit("project".into(), plan.sync_id, CommitSyncRequest::default())
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        metric_value(&manager, "bytes_total", &["kind=\"sync_upload\""]),
+        4.0
+    );
+    assert_eq!(
+        metric_value(
+            &manager,
+            "operations_total",
+            &["kind=\"sync_upload\"", "outcome=\"error\""]
+        ),
+        1.0
+    );
+    assert_eq!(
+        metric_value(
+            &manager,
+            "operations_total",
+            &["kind=\"sync_commit\"", "outcome=\"success\""]
+        ),
+        1.0
+    );
+    assert_eq!(
+        metric_value(&manager, "active", &["kind=\"sync_upload\""]),
+        0.0
+    );
+    assert_eq!(
+        metric_value(&manager, "active", &["kind=\"sync_session\""]),
+        0.0
+    );
+    assert!(!manager.is_degraded());
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn sync_download_metrics_follow_body_consumption_and_cancellation() {
+    let temp = tempfile::tempdir().unwrap();
+    let manager = SyncManager::new(test_config(temp.path()));
+    tokio::fs::create_dir(temp.path().join("project"))
+        .await
+        .unwrap();
+    tokio::fs::write(temp.path().join("project/top.v"), b"data")
+        .await
+        .unwrap();
+    let unread = manager
+        .download_file("project".into(), "top.v".into(), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        metric_value(&manager, "bytes_total", &["kind=\"sync_download\""]),
+        0.0
+    );
+    drop(unread);
+    assert_eq!(
+        metric_value(
+            &manager,
+            "operations_total",
+            &["kind=\"sync_download\"", "outcome=\"cancelled\""]
+        ),
+        1.0
+    );
+    let response = manager
+        .download_file("project".into(), "top.v".into(), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .as_ref(),
+        b"data"
+    );
+    assert_eq!(
+        metric_value(&manager, "bytes_total", &["kind=\"sync_download\""]),
+        4.0
+    );
+    assert_eq!(
+        metric_value(
+            &manager,
+            "operations_total",
+            &["kind=\"sync_download\"", "outcome=\"success\""]
+        ),
+        1.0
+    );
+    assert_eq!(
+        metric_value(&manager, "active", &["kind=\"sync_download\""]),
+        0.0
+    );
+    let head = manager
+        .head_file("project".into(), "top.v".into(), None)
+        .await
+        .unwrap();
+    assert_eq!(head.headers()[CONTENT_LENGTH], "4");
+    assert!(
+        head.into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .is_empty()
+    );
+    assert_eq!(
+        metric_value(&manager, "bytes_total", &["kind=\"sync_download\""]),
+        4.0
+    );
+    assert_eq!(
+        metric_value(
+            &manager,
+            "operations_total",
+            &["kind=\"sync_download_metadata\"", "outcome=\"success\""]
+        ),
+        1.0
+    );
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn cleanup_failure_is_degraded_until_all_pending_sessions_recover() {
+    let temp = tempfile::tempdir().unwrap();
+    let manager = SyncManager::new(test_config(temp.path()));
+    // Replacing a private staging directory with a link safely forces cleanup
+    // to fail even under root, without making the test depend on permissions.
+    let external = tempfile::tempdir().unwrap();
+    let mut broken = Vec::new();
+    for _ in 0..2 {
+        let plan = manager
+            .push_plan("project".into(), PushPlanRequest::default())
+            .await
+            .unwrap();
+        let session = manager.session(plan.sync_id, "project").await.unwrap();
+        let staging = session.data.lock().await.plan.staging_dir.clone();
+        tokio::fs::remove_dir_all(&staging).await.unwrap();
+        std::os::unix::fs::symlink(external.path(), &staging).unwrap();
+        assert!(manager.abort("project".into(), plan.sync_id).await.is_err());
+        assert!(manager.is_degraded());
+        broken.push((session, staging));
+    }
+    assert_eq!(
+        metric_value(&manager, "active", &["kind=\"sync_cleanup_pending\""]),
+        2.0
+    );
+    for (index, (session, staging)) in broken.into_iter().enumerate() {
+        tokio::fs::remove_file(staging).await.unwrap();
+        manager.cleanup_session(&session).await.unwrap();
+        assert_eq!(manager.is_degraded(), index == 0);
+    }
+    assert_eq!(
+        metric_value(&manager, "active", &["kind=\"sync_cleanup_pending\""]),
+        0.0
+    );
+    assert_eq!(
+        metric_value(
+            &manager,
+            "events_total",
+            &["kind=\"sync_cleanup\"", "outcome=\"recovered\""]
+        ),
+        2.0
+    );
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn detached_accepted_task_panic_marks_sync_unhealthy() {
+    let temp = tempfile::tempdir().unwrap();
+    let manager = SyncManager::new(test_config(temp.path()));
+    let worker = manager.clone();
+    let entered = Arc::new(Notify::new());
+    let entered_worker = entered.clone();
+    let release = Arc::new(Notify::new());
+    let release_worker = release.clone();
+    let observer = tokio::spawn(async move {
+        worker
+            .tracked::<()>("sync_plan", async move {
+                entered_worker.notify_one();
+                release_worker.notified().await;
+                panic!("test accepted sync worker panic");
+            })
+            .await
+    });
+    entered.notified().await;
+    observer.abort();
+    let _ = observer.await;
+    release.notify_one();
+    time::timeout(Duration::from_secs(5), manager.shutdown())
+        .await
+        .unwrap();
+    assert!(manager.is_degraded());
+    assert_eq!(
+        metric_value(&manager, "active", &["kind=\"sync_plan\""]),
+        0.0
+    );
+    assert_eq!(
+        metric_value(
+            &manager,
+            "background_task_failures_total",
+            &["task=\"sync_operation\""]
+        ),
+        1.0
+    );
+}
+
 fn test_config(root: &Path) -> RuntimeConfig {
     crate::config::AppConfig {
         vivado_path: "/bin/true".into(),

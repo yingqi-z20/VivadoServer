@@ -224,6 +224,18 @@ After all response bodies finish and local results pass validation, call `POST .
 
 `GET /healthz`, `GET /readyz`, and `GET /openapi.json` are public. Readiness reports service coordination/cleanup health without launching Vivado or proving license availability. All application responses have `x-request-id`; 401 also has `WWW-Authenticate: Bearer`.
 
+Healthy readiness is HTTP 200 with `{"status":"ready"}`. Unready responses use HTTP 503 with `status:"degraded"` and a nonempty `reasons` array containing `shutting_down`, `workflow_cleanup_failed`, and/or `background_task_failed`. `failed_tasks` is included when nonempty and identifies failed supervised tasks. For example:
+
+```json
+{
+  "status": "degraded",
+  "reasons": ["background_task_failed"],
+  "failed_tasks": ["workflow_reaper"]
+}
+```
+
+Do not interpret missing optional arrays as an error, and allow future reason/task values. `GET /metrics` returns Prometheus text and requires the same bearer token as the workflow API. It defaults to enabled; `observability.metrics_enabled=false` removes the route and returns 404 even without authentication. This is an operator interface, not a workflow synchronization mechanism.
+
 ```json
 {
   "error": {
@@ -236,6 +248,8 @@ After all response bodies finish and local results pass validation, call `POST .
 ```
 
 `details` is always an object. Record the request ID when reporting failures. Codes distinguish workflow phase, project re-upload, and sync conflicts; do not branch on human-readable messages.
+
+Retain `workflow_id`, `session_id`, and `sync_id` alongside request IDs in client diagnostics. Server logs correlate these identities even when accepted background work outlives its original request. Server HTTP completion metrics describe handing a body to the transport, so client validation remains required. Optional server-side PTY archives do not extend API output retention, recover expired cursors, or restore workflow IDs after a restart. See the [observability runbook](observability.md) for operator access and archive completeness checks.
 
 | HTTP status | Meaning |
 |---|---|

@@ -144,7 +144,25 @@ impl Drop for PtyProcess {
         // Never invoke portable-pty's killer: its Unix implementation can reap
         // early and invalidate the PGID before descendants have been handled.
         if self.child.is_some() && self.identity_owned {
-            let _ = self.signal_group(libc::SIGKILL);
+            match self.signal_group(libc::SIGKILL) {
+                Ok(()) => tracing::error!(
+                    event = "session_emergency_process_cleanup",
+                    pid = self.pid,
+                    "Process owner dropped before cleanup completed; sent emergency SIGKILL"
+                ),
+                Err(error) => tracing::error!(
+                    event = "session_emergency_process_cleanup_failed",
+                    pid = self.pid,
+                    %error,
+                    "Process owner dropped before cleanup completed and emergency SIGKILL failed"
+                ),
+            }
+        } else if self.child.is_some() {
+            tracing::error!(
+                event = "session_process_ownership_lost",
+                pid = self.pid,
+                "Process owner dropped with unconfirmed cleanup after losing process identity"
+            );
         }
     }
 }

@@ -512,7 +512,11 @@ impl Drop for TempPathGuard {
             // Drop is also run when an HTTP handler is cancelled. A small
             // synchronous unlink here prevents cancelled uploads from leaving
             // unbounded `.part` files behind.
-            let _ = std::fs::remove_file(path);
+            if let Err(error) = std::fs::remove_file(&path)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(%error, path = %path.display(), "failed to remove incomplete sync upload");
+            }
         }
     }
 }
@@ -528,7 +532,9 @@ pub(super) async fn open_file_for_transfer(
     rel_path: String,
     max_file_bytes: u64,
 ) -> Result<(File, FileTransfer), AppError> {
+    let span = tracing::Span::current();
     tokio::task::spawn_blocking(move || {
+        let _entered = span.enter();
         open_file_for_transfer_blocking(&path, rel_path, max_file_bytes)
     })
     .await
@@ -600,58 +606,62 @@ pub(super) async fn ensure_baseline_matches(
     );
     let target = target.to_path_buf();
     let baseline = baseline.cloned();
-    tokio::task::spawn_blocking(move || match baseline {
-        None => {
-            if target.exists() {
-                Err(AppError::Conflict(format!(
-                    "target changed since plan: {}",
-                    target.display()
-                )))
-            } else {
-                Ok(())
+    let span = tracing::Span::current();
+    tokio::task::spawn_blocking(move || {
+        let _entered = span.enter();
+        match baseline {
+            None => {
+                if target.exists() {
+                    Err(AppError::Conflict(format!(
+                        "target changed since plan: {}",
+                        target.display()
+                    )))
+                } else {
+                    Ok(())
+                }
             }
+            Some(entry) => match entry.kind {
+                ManifestEntryKind::Dir => {
+                    if target.is_dir() {
+                        Ok(())
+                    } else {
+                        Err(AppError::Conflict(format!(
+                            "target changed since plan: {}",
+                            entry.path
+                        )))
+                    }
+                }
+                ManifestEntryKind::File => {
+                    if !target.is_file() {
+                        return Err(AppError::Conflict(format!(
+                            "target changed since plan: {}",
+                            entry.path
+                        )));
+                    }
+                    let metadata = std::fs::metadata(&target).map_err(|error| {
+                        AppError::Internal(format!("failed to inspect baseline file: {error}"))
+                    })?;
+                    let current_sha = hash_file_blocking(&target)?;
+                    let after = std::fs::metadata(&target).map_err(internal_io)?;
+                    if metadata.len() == after.len()
+                        && metadata.modified().ok() == after.modified().ok()
+                        && Some(metadata.len()) == entry.size_bytes
+                        && Some(system_time_to_ms(metadata.modified().unwrap_or(UNIX_EPOCH)))
+                            == entry.mtime_unix_ms
+                        && Some(current_sha) == entry.sha256
+                        && executable_from_metadata(&metadata) == entry.executable
+                        && executable_from_metadata(&after) == entry.executable
+                    {
+                        Ok(())
+                    } else {
+                        Err(AppError::Conflict(format!(
+                            "target changed since plan: {}",
+                            entry.path
+                        )))
+                    }
+                }
+            },
         }
-        Some(entry) => match entry.kind {
-            ManifestEntryKind::Dir => {
-                if target.is_dir() {
-                    Ok(())
-                } else {
-                    Err(AppError::Conflict(format!(
-                        "target changed since plan: {}",
-                        entry.path
-                    )))
-                }
-            }
-            ManifestEntryKind::File => {
-                if !target.is_file() {
-                    return Err(AppError::Conflict(format!(
-                        "target changed since plan: {}",
-                        entry.path
-                    )));
-                }
-                let metadata = std::fs::metadata(&target).map_err(|error| {
-                    AppError::Internal(format!("failed to inspect baseline file: {error}"))
-                })?;
-                let current_sha = hash_file_blocking(&target)?;
-                let after = std::fs::metadata(&target).map_err(internal_io)?;
-                if metadata.len() == after.len()
-                    && metadata.modified().ok() == after.modified().ok()
-                    && Some(metadata.len()) == entry.size_bytes
-                    && Some(system_time_to_ms(metadata.modified().unwrap_or(UNIX_EPOCH)))
-                        == entry.mtime_unix_ms
-                    && Some(current_sha) == entry.sha256
-                    && executable_from_metadata(&metadata) == entry.executable
-                    && executable_from_metadata(&after) == entry.executable
-                {
-                    Ok(())
-                } else {
-                    Err(AppError::Conflict(format!(
-                        "target changed since plan: {}",
-                        entry.path
-                    )))
-                }
-            }
-        },
     })
     .await
     .map_err(|err| AppError::Internal(format!("baseline check task failed: {err}")))?
@@ -663,7 +673,9 @@ pub(super) async fn set_file_mtime(path: PathBuf, mtime_unix_ms: i64) -> Result<
         mtime_unix_ms,
         "setting synced file mtime"
     );
+    let span = tracing::Span::current();
     tokio::task::spawn_blocking(move || {
+        let _entered = span.enter();
         let seconds = mtime_unix_ms.div_euclid(1_000);
         let nanos = (mtime_unix_ms.rem_euclid(1_000) * 1_000_000) as u32;
         let mtime = FileTime::from_unix_time(seconds, nanos);
@@ -682,7 +694,9 @@ pub(super) async fn set_file_attributes(
     if let Some(mtime) = mtime_unix_ms {
         set_file_mtime(path.clone(), mtime).await?;
     }
+    let span = tracing::Span::current();
     tokio::task::spawn_blocking(move || {
+        let _entered = span.enter();
         use std::os::unix::fs::PermissionsExt;
         let metadata = std::fs::metadata(&path).map_err(|error| {
             AppError::Internal(format!("failed to read file permissions: {error}"))

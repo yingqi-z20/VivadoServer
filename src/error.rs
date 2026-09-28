@@ -10,6 +10,14 @@ use utoipa::ToSchema;
 
 const MAX_CLIENT_MESSAGE_CHARS: usize = 1_024;
 
+/// Response metadata consumed once by request telemetry. Client-controlled 4xx
+/// diagnostics are deliberately excluded from server logs.
+#[derive(Clone)]
+pub(crate) struct ErrorDiagnostic {
+    pub code: &'static str,
+    pub diagnostic: Option<String>,
+}
+
 #[derive(Debug, Clone, Error)]
 pub enum AppError {
     #[error("authentication is required")]
@@ -123,13 +131,14 @@ impl AppError {
 impl IntoResponse for AppError {
     fn into_response(self) -> axum::response::Response {
         let status = self.status();
-        let diagnostic = self.to_string();
-        if status.is_server_error() {
-            tracing::error!(status = status.as_u16(), error = %diagnostic, "request failed");
-        } else {
-            tracing::debug!(status = status.as_u16(), error = %diagnostic, "request rejected");
-        }
+        let diagnostic = ErrorDiagnostic {
+            code: self.code(),
+            diagnostic: status
+                .is_server_error()
+                .then(|| self.to_string().chars().take(4096).collect()),
+        };
         let mut response = (status, Json(self.envelope(String::new()))).into_response();
+        response.extensions_mut().insert(diagnostic);
         if status == StatusCode::UNAUTHORIZED {
             response.headers_mut().insert(
                 header::WWW_AUTHENTICATE,

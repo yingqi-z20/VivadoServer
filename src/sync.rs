@@ -2,6 +2,7 @@
 //! this manager owns accepted filesystem operations until they settle.
 mod files;
 mod model;
+mod observability;
 mod transaction;
 use crate::{
     config::RuntimeConfig,
@@ -25,6 +26,7 @@ use filetime::FileTime;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use http_body_util::BodyExt;
 pub use model::*;
+use observability::{ObservedDownload, SyncOperation};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -34,7 +36,7 @@ use std::{
     path::{Component, Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -44,10 +46,12 @@ use tokio::{
     time,
 };
 use tokio_util::{io::ReaderStream, sync::CancellationToken, task::TaskTracker};
+use tracing::Instrument;
 use transaction::CommitTransaction;
 use uuid::Uuid;
 use walkdir::WalkDir;
 const REAPER_INTERVAL: Duration = Duration::from_secs(60);
+const CLEANUP_WARNING_INTERVAL: Duration = Duration::from_secs(300);
 const MAX_GLOBS: usize = 256;
 const MAX_GLOB_BYTES: usize = 4 * 1024;
 pub(crate) const MAX_RETAINED_SYNC_RESULTS: usize = 128;
@@ -60,9 +64,14 @@ pub struct SyncManager {
     admission: Arc<AsyncMutex<()>>,
     creating: Arc<AsyncMutex<()>>,
     closed: Arc<AtomicBool>,
+    reaper_degraded: Arc<AtomicBool>,
+    task_degraded: Arc<AtomicBool>,
+    cleanup_degraded: Arc<AtomicUsize>,
     slot: Arc<Semaphore>,
 }
 struct SyncSession {
+    sync_id: Uuid,
+    span: tracing::Span,
     data: AsyncMutex<PushSession>,
     activity: RwLock<()>,
     cancel_uploads: CancellationToken,
@@ -72,6 +81,7 @@ struct SyncSession {
 struct PushSession {
     state: SyncSessionStatus,
     project: String,
+    created_at: Instant,
     plan: CommitPlan,
     expires_deadline: Instant,
     finished_at: Option<Instant>,
@@ -79,6 +89,8 @@ struct PushSession {
     result: Option<CommitSyncResponse>,
     error: Option<AppError>,
     cleanup_pending: bool,
+    cleanup_failures: u64,
+    cleanup_last_warning: Option<Instant>,
     active_permit: Option<OwnedSemaphorePermit>,
 }
 impl PushSession {
@@ -141,6 +153,9 @@ impl SyncManager {
             admission: Arc::new(AsyncMutex::new(())),
             creating: Arc::new(AsyncMutex::new(())),
             closed: Arc::new(AtomicBool::new(false)),
+            reaper_degraded: Arc::new(AtomicBool::new(false)),
+            task_degraded: Arc::new(AtomicBool::new(false)),
+            cleanup_degraded: Arc::new(AtomicUsize::new(0)),
             slot: Arc::new(Semaphore::new(1)),
         }
     }
@@ -148,6 +163,7 @@ impl SyncManager {
     /// prevents shutdown from missing a task accepted concurrently with draining.
     async fn tracked<T: Send + 'static>(
         &self,
+        operation: &'static str,
         work: impl Future<Output = Result<T, AppError>> + Send + 'static,
     ) -> Result<T, AppError> {
         let gate = self.admission.lock().await;
@@ -156,9 +172,23 @@ impl SyncManager {
                 "sync manager is shutting down".to_string(),
             ));
         }
-        let task = self.tasks.spawn(work);
+        let telemetry = self.config.telemetry.clone();
+        let mut observed = SyncOperation::new(telemetry, operation, true)
+            .with_failure_marker(self.task_degraded.clone());
+        let task = self.tasks.spawn(
+            async move {
+                // Record the result inside the accepted task: dropping the HTTP
+                // observer must not discard the original filesystem failure.
+                let result = work.await;
+                observed.finish_result(&result);
+                result
+            }
+            .in_current_span(),
+        );
         drop(gate);
         task.await.map_err(|error| {
+            self.task_degraded.store(true, Ordering::Release);
+            tracing::error!(operation, %error, "accepted sync task did not settle");
             AppError::ProjectReuploadRequired(format!("sync task did not settle: {error}"))
         })?
     }
@@ -174,13 +204,33 @@ impl SyncManager {
                     _ = cancellation.cancelled() => break,
                     _ = interval.tick() => {
                         let worker = manager.clone();
-                        let _ = manager.tracked(async move { worker.reap().await; Ok(()) }).await;
+                        match manager.tracked("sync_reaper", async move { worker.reap().await }).await {
+                            Ok(()) => {
+                                if manager.reaper_degraded.swap(false, Ordering::AcqRel) {
+                                    tracing::info!("sync reaper recovered");
+                                }
+                            }
+                            Err(error) => {
+                                if manager.closed.load(Ordering::Acquire) {
+                                    break;
+                                }
+                                if !manager.reaper_degraded.swap(true, Ordering::AcqRel) {
+                                    tracing::error!(%error, "sync reaper failed; cleanup will be retried");
+                                }
+                            }
+                        }
                     }
                 }
             }
-        })
+        }.instrument(tracing::info_span!("sync_reaper")))
+    }
+    pub(crate) fn is_degraded(&self) -> bool {
+        self.reaper_degraded.load(Ordering::Acquire)
+            || self.task_degraded.load(Ordering::Acquire)
+            || self.cleanup_degraded.load(Ordering::Acquire) > 0
     }
     pub async fn shutdown(&self) {
+        tracing::info!("draining accepted sync operations");
         {
             let _gate = self.admission.lock().await;
             self.closed.store(true, Ordering::Release);
@@ -198,11 +248,12 @@ impl SyncManager {
                 .abort_session(session, SyncSessionStatus::Aborted)
                 .await;
         }
+        tracing::info!(degraded = self.is_degraded(), "sync shutdown completed");
     }
     /// Startup discards scratch data without replaying or restoring a transaction.
     pub async fn cleanup_orphans(&self) -> Result<(), AppError> {
         let manager = self.clone();
-        self.tracked(async move {
+        self.tracked("sync_orphan_cleanup", async move {
             let _creating = manager.creating.lock().await;
             if manager.slot.available_permits() == 0 {
                 return Err(AppError::Conflict(
@@ -211,42 +262,60 @@ impl SyncManager {
             }
             let root = private_staging_root(&manager.config.workspace_root).await?;
             let mut entries = tokio::fs::read_dir(&root).await.map_err(internal_io)?;
+            let mut removed = 0_u64;
             while let Some(entry) = entries.next_entry().await.map_err(internal_io)? {
                 remove_private_entry(&root, &entry.path()).await?;
+                removed += 1;
             }
+            tracing::info!(removed, "orphaned sync staging cleanup completed");
             Ok(())
         })
         .await
     }
+    #[tracing::instrument(level = "info", skip_all, fields(project = %project))]
     pub async fn manifest(
         &self,
         project: String,
         request: ManifestRequest,
     ) -> Result<ManifestResponse, AppError> {
-        self.scan_manifest(
-            resolve_project_dir(&self.config.workspace_root, &project)?,
-            SyncFilters::new(&request.include_globs, &request.exclude_globs)?,
-        )
-        .await
+        let mut observed =
+            SyncOperation::new(self.config.telemetry.clone(), "sync_manifest", false);
+        let result = async {
+            self.scan_manifest(
+                resolve_project_dir(&self.config.workspace_root, &project)?,
+                SyncFilters::new(&request.include_globs, &request.exclude_globs)?,
+            )
+            .await
+        }
+        .await;
+        observed.finish_result(&result);
+        result
     }
+    #[tracing::instrument(level = "info", skip_all, fields(project = %project))]
     pub async fn push_plan(
         &self,
         project: String,
         request: PushPlanRequest,
     ) -> Result<PushPlanResponse, AppError> {
         let manager = self.clone();
-        self.tracked(async move { manager.create_plan(project, request, false).await })
-            .await
+        self.tracked("sync_plan", async move {
+            manager.create_plan(project, request, false).await
+        })
+        .await
     }
+    #[tracing::instrument(level = "info", skip_all, fields(project = %project))]
     pub async fn push_reset_plan(
         &self,
         project: String,
         request: PushPlanRequest,
     ) -> Result<PushPlanResponse, AppError> {
         let manager = self.clone();
-        self.tracked(async move { manager.create_plan(project, request, true).await })
-            .await
+        self.tracked("sync_reset_plan", async move {
+            manager.create_plan(project, request, true).await
+        })
+        .await
     }
+    #[tracing::instrument(level = "info", skip_all, fields(project = %project, sync_id = tracing::field::Empty, reset))]
     async fn create_plan(
         &self,
         project: String,
@@ -350,6 +419,7 @@ impl SyncManager {
         sort_paths(&mut plan.delete_files);
         sort_paths_deepest_first(&mut plan.delete_dirs);
         let sync_id = Uuid::new_v4();
+        tracing::Span::current().record("sync_id", tracing::field::display(sync_id));
         let expires_at = Utc::now()
             + chrono::Duration::from_std(self.config.sync_session_ttl())
                 .map_err(|error| AppError::Internal(format!("invalid sync ttl: {error}")))?;
@@ -361,7 +431,12 @@ impl SyncManager {
         )
         .await
         {
-            let _ = remove_staging_dir(&self.config.workspace_root, &plan.staging_dir).await;
+            if let Err(cleanup_error) =
+                remove_staging_dir(&self.config.workspace_root, &plan.staging_dir).await
+            {
+                tracing::error!(%cleanup_error, "failed to remove rejected sync plan staging");
+                self.config.telemetry.event("sync_cleanup", "error");
+            }
             return Err(error);
         }
         let response = PushPlanResponse {
@@ -379,9 +454,12 @@ impl SyncManager {
         self.sessions.write().await.insert(
             sync_id,
             Arc::new(SyncSession {
+                sync_id,
+                span: tracing::Span::current(),
                 data: AsyncMutex::new(PushSession {
                     state: SyncSessionStatus::Open,
                     project,
+                    created_at: Instant::now(),
                     plan,
                     expires_deadline: Instant::now() + self.config.sync_session_ttl(),
                     finished_at: None,
@@ -389,6 +467,8 @@ impl SyncManager {
                     result: None,
                     error: None,
                     cleanup_pending: false,
+                    cleanup_failures: 0,
+                    cleanup_last_warning: None,
                     active_permit: Some(permit),
                 }),
                 activity: RwLock::new(()),
@@ -397,9 +477,31 @@ impl SyncManager {
                 cleanup: AsyncMutex::new(()),
             }),
         );
+        self.config.telemetry.add_active("sync_session", 1);
+        self.config.telemetry.event("sync_session", "created");
+        tracing::info!(
+            upload_files = response.upload_files.len(),
+            create_dirs = response.create_dirs.len(),
+            delete_files = response.delete_files.len(),
+            delete_dirs = response.delete_dirs.len(),
+            expires_at = %response.expires_at,
+            "sync plan created"
+        );
         Ok(response)
     }
+    #[tracing::instrument(level = "info", skip_all, fields(project = %project))]
     pub async fn pull_plan(
+        &self,
+        project: String,
+        request: PullPlanRequest,
+    ) -> Result<PullPlanResponse, AppError> {
+        let mut observed =
+            SyncOperation::new(self.config.telemetry.clone(), "sync_pull_plan", false);
+        let result = self.create_pull_plan(project, request).await;
+        observed.finish_result(&result);
+        result
+    }
+    async fn create_pull_plan(
         &self,
         project: String,
         request: PullPlanRequest,
@@ -477,8 +579,16 @@ impl SyncManager {
         sort_paths(&mut response.delete_files);
         sort_paths_deepest_first(&mut response.delete_dirs);
         response.download_files.sort_by(|a, b| a.path.cmp(&b.path));
+        tracing::debug!(
+            download_files = response.download_files.len(),
+            create_dirs = response.create_dirs.len(),
+            delete_files = response.delete_files.len(),
+            delete_dirs = response.delete_dirs.len(),
+            "sync pull plan created"
+        );
         Ok(response)
     }
+    #[tracing::instrument(level = "info", skip_all, fields(project = %project, %sync_id, path = tracing::field::Empty))]
     pub async fn upload_file(
         &self,
         project: String,
@@ -488,10 +598,13 @@ impl SyncManager {
         body: Body,
     ) -> Result<UploadResponse, AppError> {
         let manager = self.clone();
-        self.tracked(async move {
-            manager
+        self.tracked("sync_upload", async move {
+            let response = manager
                 .receive_upload(project, sync_id, raw_path, content_length, body)
-                .await
+                .await?;
+            manager.config.telemetry.add_bytes("sync_upload", response.size_bytes);
+            tracing::debug!(path = %response.path, bytes = response.size_bytes, "sync upload validated and staged");
+            Ok(response)
         })
         .await
     }
@@ -504,6 +617,7 @@ impl SyncManager {
         body: Body,
     ) -> Result<UploadResponse, AppError> {
         let path = normalize_sync_path(&raw_path)?;
+        tracing::Span::current().record("path", path.as_str());
         let session = self.session(sync_id, &project).await?;
         let _activity = session.activity.read().await;
         let (expected, staging_dir) = {
@@ -558,6 +672,7 @@ impl SyncManager {
             sha256: expected.transfer.sha256,
         })
     }
+    #[tracing::instrument(level = "info", skip_all, fields(project = %project, %sync_id))]
     pub async fn commit(
         &self,
         project: String,
@@ -565,8 +680,10 @@ impl SyncManager {
         _request: CommitSyncRequest,
     ) -> Result<CommitSyncResponse, AppError> {
         let manager = self.clone();
-        self.tracked(async move { manager.commit_session(project, sync_id).await })
-            .await
+        self.tracked("sync_commit_request", async move {
+            manager.commit_session(project, sync_id).await
+        })
+        .await
     }
     async fn commit_session(
         &self,
@@ -604,34 +721,55 @@ impl SyncManager {
             }
         };
         if let Some(plan) = plan {
+            let mut observed =
+                SyncOperation::new(self.config.telemetry.clone(), "sync_commit", true)
+                    .with_failure_marker(self.task_degraded.clone());
+            tracing::info!(%sync_id, %project, reset = plan.reset,
+                upload_files = plan.upload_files.len(), "sync commit started");
             let worker = self.clone();
             let owned_plan = plan.clone();
-            let result =
-                tokio::spawn(async move { worker.apply_commit(sync_id, &owned_plan).await })
-                    .await
-                    .unwrap_or_else(|error| {
-                        Err(AppError::ProjectReuploadRequired(format!(
-                            "commit task did not settle: {error}"
-                        )))
-                    });
+            let result = tokio::spawn(
+                async move { worker.apply_commit(sync_id, &owned_plan).await }.in_current_span(),
+            )
+            .await
+            .unwrap_or_else(|error| {
+                self.config.telemetry.task_failed("sync_commit");
+                self.task_degraded.store(true, Ordering::Release);
+                tracing::error!(%sync_id, %error, "sync commit worker did not settle");
+                Err(AppError::ProjectReuploadRequired(format!(
+                    "commit task did not settle: {error}"
+                )))
+            });
             {
                 let mut data = session.data.lock().await;
                 match &result {
                     Ok(response) => {
                         data.state = SyncSessionStatus::Committed;
                         data.result = Some(response.clone());
+                        self.config.telemetry.event("sync_session", "committed");
+                        tracing::info!(%sync_id, %project, uploaded_files = response.uploaded_files.len(),
+                            created_dirs = response.created_dirs.len(), deleted_files = response.deleted_files.len(),
+                            deleted_dirs = response.deleted_dirs.len(),
+                            lifetime_ms = data.created_at.elapsed().as_millis() as u64, "sync commit completed");
                     }
                     Err(error) => {
                         data.state = SyncSessionStatus::Failed;
                         data.error = Some(error.clone());
+                        self.config.telemetry.event("sync_session", "failed");
+                        tracing::error!(%sync_id, %project, error_code = error.code(), %error,
+                            lifetime_ms = data.created_at.elapsed().as_millis() as u64, "sync commit failed");
                     }
                 }
                 data.finished_at = Some(Instant::now());
                 data.cleanup_pending = true;
                 data.release_plan();
+                self.config.telemetry.add_active("sync_session", -1);
             }
-            self.cleanup_session(&session).await;
+            // Cleanup is retried separately; a committed transaction remains
+            // committed even when removing private scratch data fails.
+            let _ = self.cleanup_session(&session).await;
             session.notify.notify_waiters();
+            observed.finish(if result.is_ok() { "success" } else { "error" });
             return result;
         }
         loop {
@@ -756,7 +894,7 @@ impl SyncManager {
             })
         }
         .await;
-        settle_transaction(operations, &mut transaction).await
+        settle_transaction(operations, &mut transaction, &self.config.telemetry).await
     }
     async fn apply_reset(
         &self,
@@ -780,7 +918,9 @@ impl SyncManager {
         }
         let config = self.config.clone();
         let snapshot = files.clone();
+        let span = tracing::Span::current();
         let actual = tokio::task::spawn_blocking(move || {
+            let _entered = span.enter();
             scan_manifest_blocking(
                 snapshot,
                 SyncFilters::new(&[], &[])?,
@@ -816,15 +956,16 @@ impl SyncManager {
                 deleted_files: Vec::new(),
                 deleted_dirs: Vec::new(),
             });
-        settle_transaction(result, &mut transaction).await
+        settle_transaction(result, &mut transaction, &self.config.telemetry).await
     }
+    #[tracing::instrument(level = "info", skip_all, fields(project = %project, %sync_id))]
     pub async fn abort(
         &self,
         project: String,
         sync_id: Uuid,
     ) -> Result<AbortSyncResponse, AppError> {
         let manager = self.clone();
-        self.tracked(async move {
+        self.tracked("sync_abort", async move {
             let session = manager.session(sync_id, &project).await?;
             manager
                 .abort_session(session.clone(), SyncSessionStatus::Aborted)
@@ -843,9 +984,10 @@ impl SyncManager {
     }
     /// Ok means every plan for this project has settled and private cleanup is
     /// complete. Workflow shutdown may retry an error while retaining its slot.
+    #[tracing::instrument(level = "info", skip_all, fields(project = %project))]
     pub async fn abort_open(&self, project: String) -> Result<(), AppError> {
         let manager = self.clone();
-        self.tracked(async move {
+        self.tracked("sync_abort_project", async move {
             let _creating = manager.creating.lock().await;
             let sessions: Vec<_> = manager.sessions.read().await.values().cloned().collect();
             for session in sessions {
@@ -860,6 +1002,16 @@ impl SyncManager {
         .await
     }
     async fn abort_session(
+        &self,
+        session: Arc<SyncSession>,
+        terminal: SyncSessionStatus,
+    ) -> Result<(), AppError> {
+        let span = session.span.clone();
+        self.abort_session_inner(session, terminal)
+            .instrument(span)
+            .await
+    }
+    async fn abort_session_inner(
         &self,
         session: Arc<SyncSession>,
         terminal: SyncSessionStatus,
@@ -882,34 +1034,75 @@ impl SyncManager {
                 data.finished_at = Some(Instant::now());
                 data.cleanup_pending = true;
                 data.release_plan();
+                self.config.telemetry.add_active("sync_session", -1);
+                let outcome = if terminal == SyncSessionStatus::Expired {
+                    "expired"
+                } else {
+                    "aborted"
+                };
+                self.config.telemetry.event("sync_session", outcome);
+                tracing::info!(sync_id = %session.sync_id, project = %data.project, outcome,
+                    lifetime_ms = data.created_at.elapsed().as_millis() as u64, "sync plan closed");
             }
             drop(data);
-            self.cleanup_session(&session).await;
+            let cleanup = self.cleanup_session(&session).await;
             session.notify.notify_waiters();
-            if session.data.lock().await.cleanup_pending {
-                return Err(AppError::Internal(
-                    "sync staging cleanup is still pending".to_string(),
-                ));
-            }
+            cleanup?;
             return Ok(());
         }
     }
-    async fn cleanup_session(&self, session: &SyncSession) {
+    async fn cleanup_session(&self, session: &SyncSession) -> Result<(), AppError> {
         let _cleanup = session.cleanup.lock().await;
         let path = {
             let data = session.data.lock().await;
             if !data.cleanup_pending {
-                return;
+                return Ok(());
             }
             data.plan.staging_dir.clone()
         };
-        match remove_staging_dir(&self.config.workspace_root, &path).await {
-            Ok(()) => session.data.lock().await.cleanup_pending = false,
+        let started = Instant::now();
+        let result = remove_staging_dir(&self.config.workspace_root, &path).await;
+        self.config.telemetry.operation_finished(
+            "sync_cleanup",
+            if result.is_ok() { "success" } else { "error" },
+            started.elapsed(),
+        );
+        match &result {
+            Ok(()) => {
+                let mut data = session.data.lock().await;
+                data.cleanup_pending = false;
+                if data.cleanup_failures > 0 {
+                    self.cleanup_degraded.fetch_sub(1, Ordering::AcqRel);
+                    self.config.telemetry.add_active("sync_cleanup_pending", -1);
+                    self.config.telemetry.event("sync_cleanup", "recovered");
+                    tracing::info!(sync_id = %session.sync_id, project = %data.project,
+                        attempts = data.cleanup_failures.saturating_add(1), "private sync cleanup recovered");
+                    data.cleanup_failures = 0;
+                    data.cleanup_last_warning = None;
+                }
+            }
             Err(error) => {
-                tracing::warn!(%error, staging = %path.display(), "private sync cleanup will be retried")
+                let mut data = session.data.lock().await;
+                if data.cleanup_failures == 0 {
+                    self.cleanup_degraded.fetch_add(1, Ordering::AcqRel);
+                    self.config.telemetry.add_active("sync_cleanup_pending", 1);
+                }
+                data.cleanup_failures = data.cleanup_failures.saturating_add(1);
+                if data
+                    .cleanup_last_warning
+                    .is_none_or(|at| at.elapsed() >= CLEANUP_WARNING_INTERVAL)
+                {
+                    tracing::warn!(%error, sync_id = %session.sync_id, project = %data.project,
+                        attempts = data.cleanup_failures, staging = %path.display(), "private sync cleanup will be retried");
+                    data.cleanup_last_warning = Some(Instant::now());
+                } else {
+                    tracing::debug!(%error, sync_id = %session.sync_id, attempts = data.cleanup_failures,
+                        "private sync cleanup retry failed");
+                }
             }
         }
         self.prune_results().await;
+        result
     }
     pub async fn status(
         &self,
@@ -928,13 +1121,52 @@ impl SyncManager {
             error_message: data.error.as_ref().map(AppError::client_message),
         })
     }
+    #[tracing::instrument(level = "info", skip_all, fields(project = %project, path = tracing::field::Empty))]
     pub async fn download_file(
         &self,
         project: String,
         raw_path: String,
         if_match: Option<String>,
     ) -> Result<Response, AppError> {
+        let mut observed =
+            SyncOperation::new(self.config.telemetry.clone(), "sync_download", false);
+        match self.prepare_download(project, raw_path, if_match).await {
+            Ok((response, size)) => {
+                Ok(response.map(|body| Body::new(ObservedDownload::new(body, size, observed))))
+            }
+            Err(error) => {
+                observed.finish_result::<()>(&Err(error.clone()));
+                Err(error)
+            }
+        }
+    }
+    #[tracing::instrument(level = "info", skip_all, fields(project = %project, path = tracing::field::Empty))]
+    pub(crate) async fn head_file(
+        &self,
+        project: String,
+        raw_path: String,
+        if_match: Option<String>,
+    ) -> Result<Response, AppError> {
+        let mut observed = SyncOperation::new(
+            self.config.telemetry.clone(),
+            "sync_download_metadata",
+            false,
+        );
+        let result = self
+            .prepare_download(project, raw_path, if_match)
+            .await
+            .map(|(response, _)| response.map(|_| Body::empty()));
+        observed.finish_result(&result);
+        result
+    }
+    async fn prepare_download(
+        &self,
+        project: String,
+        raw_path: String,
+        if_match: Option<String>,
+    ) -> Result<(Response, u64), AppError> {
         let path = normalize_sync_path(&raw_path)?;
+        tracing::Span::current().record("path", path.as_str());
         let dir = resolve_project_dir(&self.config.workspace_root, &project)?;
         self.check_project_root(&dir).await?;
         ensure_path_has_no_links(dir.clone(), path.clone()).await?;
@@ -989,7 +1221,7 @@ impl SyncManager {
                 })?,
             );
         }
-        Ok(response)
+        Ok((response, transfer.size_bytes))
     }
     async fn session(&self, sync_id: Uuid, project: &str) -> Result<Arc<SyncSession>, AppError> {
         let session = self
@@ -1026,7 +1258,9 @@ impl SyncManager {
             });
         }
         let config = self.config.clone();
+        let span = tracing::Span::current();
         tokio::task::spawn_blocking(move || {
+            let _entered = span.enter();
             scan_manifest_blocking(
                 dir,
                 filters,
@@ -1037,8 +1271,9 @@ impl SyncManager {
         .await
         .map_err(|error| AppError::Internal(format!("manifest task failed: {error}")))?
     }
-    async fn reap(&self) {
+    async fn reap(&self) -> Result<(), AppError> {
         let sessions: Vec<_> = self.sessions.read().await.values().cloned().collect();
+        let mut first_error = None;
         for session in sessions {
             let data = session.data.lock().await;
             let expired =
@@ -1048,15 +1283,22 @@ impl SyncManager {
                 SyncSessionStatus::Open | SyncSessionStatus::Committing
             );
             drop(data);
-            if expired {
-                let _ = self
-                    .abort_session(session.clone(), SyncSessionStatus::Expired)
-                    .await;
+            let result = if expired {
+                self.abort_session(session.clone(), SyncSessionStatus::Expired)
+                    .await
             } else if terminal {
-                self.cleanup_session(&session).await;
+                self.cleanup_session(&session)
+                    .instrument(session.span.clone())
+                    .await
+            } else {
+                Ok(())
+            };
+            if let Err(error) = result {
+                first_error.get_or_insert(error);
             }
         }
         self.prune_results().await;
+        first_error.map_or(Ok(()), Err)
     }
 
     async fn prune_results(&self) {
@@ -1087,8 +1329,9 @@ impl SyncManager {
         let retention = self.config.sync_result_retention();
         let mut sessions = self.sessions.write().await;
         for (index, (id, at)) in finished.into_iter().enumerate() {
-            if index < excess || at.elapsed() >= retention {
-                sessions.remove(&id);
+            if (index < excess || at.elapsed() >= retention) && sessions.remove(&id).is_some() {
+                self.config.telemetry.event("sync_session", "pruned");
+                tracing::debug!(sync_id = %id, "terminal sync result pruned");
             }
         }
     }
@@ -1096,15 +1339,32 @@ impl SyncManager {
 async fn settle_transaction<T>(
     result: Result<T, AppError>,
     transaction: &mut CommitTransaction,
+    telemetry: &crate::observability::Observability,
 ) -> Result<T, AppError> {
     match result {
         Ok(value) => Ok(value),
-        Err(error) => match transaction.rollback().await {
-            Ok(()) => Err(error),
-            Err(rollback) => Err(AppError::ProjectReuploadRequired(format!(
-                "sync failed ({error}); rollback failed ({rollback})"
-            ))),
-        },
+        Err(error) => {
+            let started = Instant::now();
+            tracing::warn!(%error, "sync transaction failed; rolling back applied changes");
+            match transaction.rollback().await {
+                Ok(()) => {
+                    telemetry.operation_finished("sync_rollback", "success", started.elapsed());
+                    tracing::info!(
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "sync transaction rollback completed"
+                    );
+                    Err(error)
+                }
+                Err(rollback) => {
+                    telemetry.operation_finished("sync_rollback", "error", started.elapsed());
+                    tracing::error!(%error, %rollback, elapsed_ms = started.elapsed().as_millis() as u64,
+                        "sync rollback failed; project requires complete upload");
+                    Err(AppError::ProjectReuploadRequired(format!(
+                        "sync failed ({error}); rollback failed ({rollback})"
+                    )))
+                }
+            }
+        }
     }
 }
 fn internal_io(error: std::io::Error) -> AppError {
@@ -1163,7 +1423,10 @@ async fn create_staging_dir(workspace: &Path, sync_id: Uuid) -> Result<PathBuf, 
     }
     .await;
     if let Err(error) = create {
-        let _ = remove_private_entry(&root, &dir).await;
+        if let Err(cleanup_error) = remove_private_entry(&root, &dir).await {
+            tracing::warn!(%error, %cleanup_error, staging = %dir.display(),
+                "failed to remove partially created sync staging");
+        }
         return Err(error);
     }
     Ok(dir)

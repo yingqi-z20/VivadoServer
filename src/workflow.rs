@@ -23,11 +23,15 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, VecDeque},
     future::Future,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 use tokio::sync::{Notify, OwnedRwLockReadGuard, RwLock, RwLockWriteGuard};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
+use tracing::Instrument;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
@@ -61,6 +65,29 @@ pub enum WorkflowStatus {
 impl WorkflowStatus {
     pub fn is_terminal(self) -> bool {
         matches!(self, Self::Completed | Self::Cancelled | Self::Failed)
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Preparing => "preparing",
+            Self::Running => "running",
+            Self::Pulling => "pulling",
+            Self::Stopping => "stopping",
+            Self::Completed => "completed",
+            Self::Cancelled => "cancelled",
+            Self::Failed => "failed",
+        }
+    }
+
+    fn phase_metric(self) -> &'static str {
+        match self {
+            Self::Preparing => "workflow_phase_preparing",
+            Self::Running => "workflow_phase_running",
+            Self::Pulling => "workflow_phase_pulling",
+            Self::Stopping => "workflow_phase_stopping",
+            // Only nonterminal phases have a duration to record.
+            _ => "workflow_phase_terminal",
+        }
     }
 }
 
@@ -96,6 +123,8 @@ struct WorkflowData {
     terminal_error: Option<AppError>,
     stop_reason: TerminationReason,
     invalidate_project: bool,
+    started: Instant,
+    phase_started: Instant,
 }
 
 struct Workflow {
@@ -103,6 +132,7 @@ struct Workflow {
     activity: Arc<RwLock<()>>,
     cancel: CancellationToken,
     initialized: Notify,
+    span: tracing::Span,
 }
 
 #[derive(Default)]
@@ -119,6 +149,7 @@ struct Inner {
     projects: ProjectStore,
     registry: Mutex<Registry>,
     tasks: TaskTracker,
+    background_fault: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -153,12 +184,18 @@ impl WorkflowManager {
             projects,
             registry: Mutex::new(Registry::default()),
             tasks: TaskTracker::new(),
+            background_fault: AtomicBool::new(false),
         }))
     }
 
     // Register under the same gate used by shutdown. TaskTracker::close alone
     // does not reject new tasks, so it cannot serve as the admission barrier.
-    async fn managed<T, F>(&self, future: F) -> Result<T, AppError>
+    async fn managed<T, F>(
+        &self,
+        operation: &'static str,
+        id: Uuid,
+        future: F,
+    ) -> Result<T, AppError>
     where
         T: Send + 'static,
         F: Future<Output = Result<T, AppError>> + Send + 'static,
@@ -168,10 +205,74 @@ impl WorkflowManager {
             if registry.stopping {
                 return Err(AppError::ShuttingDown);
             }
-            self.0.tasks.spawn(future)
+            let manager = self.clone();
+            let span = tracing::info_span!("workflow_operation", operation, workflow_id = %id);
+            self.0.tasks.spawn(
+                async move {
+                    // This supervisor belongs to the manager, so dropping the HTTP
+                    // waiter cannot hide a worker panic or abandon its cleanup.
+                    match tokio::spawn(future.in_current_span()).await {
+                        Ok(result) => result,
+                        Err(error) => {
+                            manager.0.config.telemetry.task_failed(operation);
+                            tracing::error!(%error, "managed workflow task failed");
+                            let error =
+                                AppError::Internal(format!("workflow task failed: {error}"));
+                            manager.recover_task_failure(id, &error);
+                            Err(error)
+                        }
+                    }
+                }
+                .instrument(span),
+            )
         };
         task.await
             .map_err(|error| AppError::Internal(format!("workflow task failed: {error}")))?
+    }
+
+    fn recover_task_failure(&self, id: Uuid, error: &AppError) {
+        let workflow = match self.0.registry.lock() {
+            Ok(registry) => registry.entries.get(&id).cloned(),
+            Err(_) => {
+                self.0.background_fault.store(true, Ordering::Release);
+                tracing::error!(workflow_id = %id, "workflow registry poisoned; ownership retained");
+                return;
+            }
+        };
+        let Some(workflow) = workflow else { return };
+        // Poisoned metadata cannot safely establish what needs to be cleaned.
+        // Keep ownership and report degraded rather than admitting another run.
+        if workflow.data.is_poisoned() {
+            self.0.background_fault.store(true, Ordering::Release);
+            tracing::error!(workflow_id = %id, "workflow metadata poisoned; ownership retained");
+            return;
+        }
+        {
+            let mut data = workflow.data.lock().expect("workflow metadata checked");
+            if data.initializing {
+                data.initializing = false;
+                data.initialization_error = Some(error.clone());
+                workflow.initialized.notify_waiters();
+            }
+        }
+        self.fail(&workflow, error, true);
+    }
+
+    fn transition(&self, data: &mut WorkflowData, next: WorkflowStatus) {
+        let previous = data.info.status;
+        if previous == next {
+            return;
+        }
+        let duration = data.phase_started.elapsed();
+        self.0
+            .config
+            .telemetry
+            .operation_finished(previous.phase_metric(), next.label(), duration);
+        tracing::info!(workflow_id = %data.info.workflow_id, project = %data.info.project,
+            previous_status = previous.label(), status = next.label(),
+            phase_duration_ms = duration.as_millis() as u64, "workflow phase changed");
+        data.info.status = next;
+        data.phase_started = Instant::now();
     }
 
     fn workflow(&self, id: Uuid) -> Result<Arc<Workflow>, AppError> {
@@ -226,115 +327,133 @@ impl WorkflowManager {
     ) -> Result<WorkflowInfo, AppError> {
         crate::workspace::validate_project_name(&request.project)?;
         let manager = self.clone();
-        self.managed(async move {
-            let now = Utc::now();
-            let workflow = Arc::new(Workflow {
-                data: Mutex::new(WorkflowData {
-                    info: WorkflowInfo {
-                        workflow_id: id,
-                        project: request.project.clone(),
-                        status: WorkflowStatus::Preparing,
-                        session_id: None,
-                        requires_full_upload: true,
-                        cleanup_pending: false,
-                        started_at: now,
-                        last_heartbeat_at: now,
-                        ended_at: None,
-                        error_code: None,
-                        error_message: None,
-                    },
-                    request: request.clone(),
-                    heartbeat: Instant::now(),
-                    ended: None,
-                    open_sync: None,
-                    open_sync_deadline: None,
-                    sync_ids: VecDeque::new(),
-                    baseline_clean: false,
-                    transfers: 0,
-                    initializing: true,
-                    initialization_error: None,
-                    cleanup_started: false,
-                    cleanup_target: WorkflowStatus::Cancelled,
-                    terminal_error: None,
-                    stop_reason: TerminationReason::WorkflowClosed,
-                    invalidate_project: false,
-                }),
-                activity: Arc::new(RwLock::new(())),
-                cancel: CancellationToken::new(),
-                initialized: Notify::new(),
-            });
-            // Reserve before reading filesystem state. Otherwise an entire other
-            // workflow could run between the clean check and claiming this slot.
-            let activity = workflow.activity.write().await;
-            let existing = {
-                let mut registry = manager
-                    .0
-                    .registry
-                    .lock()
-                    .expect("workflow registry poisoned");
-                if registry.stopping {
-                    return Err(AppError::ShuttingDown);
-                }
-                if let Some(existing) = registry.entries.get(&id) {
-                    if existing
-                        .data
+        let span = tracing::info_span!("workflow", workflow_id = %id, project = %request.project);
+        self.managed(
+            "workflow_create",
+            id,
+            async move {
+                let now = Utc::now();
+                let started = Instant::now();
+                let workflow = Arc::new(Workflow {
+                    data: Mutex::new(WorkflowData {
+                        info: WorkflowInfo {
+                            workflow_id: id,
+                            project: request.project.clone(),
+                            status: WorkflowStatus::Preparing,
+                            session_id: None,
+                            requires_full_upload: true,
+                            cleanup_pending: false,
+                            started_at: now,
+                            last_heartbeat_at: now,
+                            ended_at: None,
+                            error_code: None,
+                            error_message: None,
+                        },
+                        request: request.clone(),
+                        heartbeat: Instant::now(),
+                        ended: None,
+                        open_sync: None,
+                        open_sync_deadline: None,
+                        sync_ids: VecDeque::new(),
+                        baseline_clean: false,
+                        transfers: 0,
+                        initializing: true,
+                        initialization_error: None,
+                        cleanup_started: false,
+                        cleanup_target: WorkflowStatus::Cancelled,
+                        terminal_error: None,
+                        stop_reason: TerminationReason::WorkflowClosed,
+                        invalidate_project: false,
+                        started,
+                        phase_started: started,
+                    }),
+                    activity: Arc::new(RwLock::new(())),
+                    cancel: CancellationToken::new(),
+                    initialized: Notify::new(),
+                    span: tracing::Span::current(),
+                });
+                // Reserve before reading filesystem state. Otherwise an entire other
+                // workflow could run between the clean check and claiming this slot.
+                let activity = workflow.activity.write().await;
+                let existing = {
+                    let mut registry = manager
+                        .0
+                        .registry
                         .lock()
-                        .expect("workflow metadata poisoned")
-                        .request
-                        != request
-                    {
-                        return Err(AppError::Conflict(
-                            "workflow ID was already used with different parameters".into(),
-                        ));
+                        .expect("workflow registry poisoned");
+                    if registry.stopping {
+                        return Err(AppError::ShuttingDown);
                     }
-                    Some(existing.clone())
-                } else {
-                    if registry.active.is_some() {
-                        return Err(AppError::WorkflowBusy);
+                    if let Some(existing) = registry.entries.get(&id) {
+                        if existing
+                            .data
+                            .lock()
+                            .expect("workflow metadata poisoned")
+                            .request
+                            != request
+                        {
+                            return Err(AppError::Conflict(
+                                "workflow ID was already used with different parameters".into(),
+                            ));
+                        }
+                        Some(existing.clone())
+                    } else {
+                        if registry.active.is_some() {
+                            return Err(AppError::WorkflowBusy);
+                        }
+                        registry.active = Some(id);
+                        registry.entries.insert(id, workflow.clone());
+                        None
                     }
-                    registry.active = Some(id);
-                    registry.entries.insert(id, workflow.clone());
-                    None
+                };
+                if let Some(existing) = existing {
+                    drop(activity);
+                    return Self::wait_initialized(&existing).await;
                 }
-            };
-            if let Some(existing) = existing {
-                drop(activity);
-                return Self::wait_initialized(&existing).await;
-            }
-            let result = async {
-                manager.0.projects.project_path(&request.project).await?;
-                let clean = manager.0.projects.is_clean(&request.project).await?;
-                if !clean && !request.reset_project {
-                    return Err(AppError::ProjectReuploadRequired(request.project.clone()));
-                }
-                Ok(clean)
-            }
-            .await;
-            {
-                let mut data = workflow.data.lock().expect("workflow metadata poisoned");
-                data.initializing = false;
-                match &result {
-                    Ok(clean) => {
-                        data.baseline_clean = *clean;
-                        data.info.requires_full_upload = request.reset_project || !clean;
+                manager.0.config.telemetry.add_active("workflow", 1);
+                manager
+                    .0
+                    .config
+                    .telemetry
+                    .event("workflow_created", "accepted");
+                tracing::info!(workflow_id = %id, project = %request.project,
+                reset_project = request.reset_project, "workflow created");
+                let result = async {
+                    manager.0.projects.project_path(&request.project).await?;
+                    let clean = manager.0.projects.is_clean(&request.project).await?;
+                    if !clean && !request.reset_project {
+                        return Err(AppError::ProjectReuploadRequired(request.project.clone()));
                     }
-                    Err(error) => data.initialization_error = Some(error.clone()),
+                    Ok(clean)
                 }
+                .await;
+                {
+                    let mut data = workflow.data.lock().expect("workflow metadata poisoned");
+                    data.initializing = false;
+                    match &result {
+                        Ok(clean) => {
+                            data.baseline_clean = *clean;
+                            data.info.requires_full_upload = request.reset_project || !clean;
+                        }
+                        Err(error) => data.initialization_error = Some(error.clone()),
+                    }
+                }
+                if let Err(error) = &result {
+                    // No business operation can pass the activity lock while this
+                    // reservation is being initialized, so there is nothing to undo.
+                    manager.terminal(
+                        &workflow,
+                        &activity,
+                        WorkflowStatus::Failed,
+                        Some(error),
+                        true,
+                    );
+                }
+                workflow.initialized.notify_waiters();
+                result.map(|_| Self::snapshot(&workflow))
             }
-            if let Err(error) = &result {
-                // No business operation can pass the activity lock while this
-                // reservation is being initialized, so there is nothing to undo.
-                manager.terminal(
-                    &workflow,
-                    &activity,
-                    WorkflowStatus::Failed,
-                    Some(error),
-                    true,
-                );
-            }
-            workflow.initialized.notify_waiters();
-            result.map(|_| Self::snapshot(&workflow))
-        })
+            .instrument(span),
+        )
         .await
     }
 
@@ -427,7 +546,7 @@ impl WorkflowManager {
         request: PushPlanRequest,
     ) -> Result<PushPlanResponse, AppError> {
         let manager = self.clone();
-        self.managed(async move {
+        self.managed("workflow_push_plan", id, async move {
             let workflow = manager.workflow(id)?;
             let _activity = workflow.activity.write().await;
             Self::phase(&workflow, &[WorkflowStatus::Preparing])?;
@@ -539,7 +658,7 @@ impl WorkflowManager {
         request: CommitSyncRequest,
     ) -> Result<CommitSyncResponse, AppError> {
         let manager = self.clone();
-        self.managed(async move {
+        self.managed("workflow_commit", id, async move {
             let workflow = manager.workflow(id)?;
             let _activity = workflow.activity.write().await;
             Self::phase(&workflow, &[WorkflowStatus::Preparing])?;
@@ -616,7 +735,7 @@ impl WorkflowManager {
         sync_id: Uuid,
     ) -> Result<AbortSyncResponse, AppError> {
         let manager = self.clone();
-        self.managed(async move {
+        self.managed("workflow_abort_sync", id, async move {
             let workflow = manager.workflow(id)?;
             let _activity = workflow.activity.write().await;
             Self::phase(&workflow, &[WorkflowStatus::Preparing])?;
@@ -656,7 +775,7 @@ impl WorkflowManager {
     ) -> Result<SessionInfo, AppError> {
         crate::session::validate_vivado_args(&request.args)?;
         let manager = self.clone();
-        self.managed(async move {
+        self.managed("workflow_start_session", id, async move {
             let workflow = manager.workflow(id)?;
             let _activity = workflow.activity.write().await;
             Self::phase(&workflow, &[WorkflowStatus::Preparing])?;
@@ -695,15 +814,26 @@ impl WorkflowManager {
                         let mut data = workflow.data.lock().expect("workflow metadata poisoned");
                         data.info.session_id = Some(session.session_id);
                         if data.info.status != WorkflowStatus::Stopping {
-                            data.info.status = WorkflowStatus::Running;
+                            manager.transition(&mut data, WorkflowStatus::Running);
                         }
                     }
                     let observer = manager.clone();
                     let observed = workflow.clone();
                     let session_id = session.session_id;
+                    let span = workflow.span.clone();
                     manager.0.tasks.spawn(async move {
-                        observer.observe_session(observed, session_id).await;
-                    });
+                        let worker_manager = observer.clone();
+                        let worker_workflow = observed.clone();
+                        let worker = tokio::spawn(async move {
+                            worker_manager.observe_session(worker_workflow, session_id).await;
+                        }.in_current_span());
+                        if let Err(error) = worker.await {
+                            observer.0.config.telemetry.task_failed("workflow_observer");
+                            tracing::error!(%session_id, %error, "workflow session observer failed");
+                            observer.recover_task_failure(id,
+                                &AppError::Internal(format!("workflow session observer failed: {error}")));
+                        }
+                    }.instrument(span));
                     Ok(session)
                 }
                 Err(error) => {
@@ -741,13 +871,16 @@ impl WorkflowManager {
                             let mut data =
                                 workflow.data.lock().expect("workflow metadata poisoned");
                             if data.info.status == WorkflowStatus::Running {
-                                data.info.status = WorkflowStatus::Pulling;
+                                self.transition(&mut data, WorkflowStatus::Pulling);
                                 data.info.requires_full_upload = false;
                             }
                         }
                         Err(error) => self.fail(&workflow, &error, true),
                     }
                 } else {
+                    tracing::warn!(%session_id, exit_code = ?session.exit_code,
+                        termination_reason = ?session.termination_reason,
+                        "workflow Vivado session did not complete successfully");
                     self.fail(
                         &workflow,
                         &AppError::ProjectReuploadRequired(
@@ -804,7 +937,7 @@ impl WorkflowManager {
 
     pub(crate) async fn stop_session(&self, id: Uuid) -> Result<SessionInfo, AppError> {
         let manager = self.clone();
-        self.managed(async move {
+        self.managed("workflow_stop_session", id, async move {
             let workflow = manager.workflow(id)?;
             let session_id = Self::session_id(&workflow)?;
             let mut session = manager.0.sessions.get_session(session_id).await?;
@@ -863,9 +996,24 @@ impl WorkflowManager {
         ))
     }
 
+    pub(crate) async fn head_download(
+        &self,
+        id: Uuid,
+        path: String,
+        if_match: Option<String>,
+    ) -> Result<Response, AppError> {
+        let lease = self.lease(id, &[WorkflowStatus::Pulling]).await?;
+        // Metadata and validator checks keep the same activity lease as GET.
+        // HEAD has no transfer body, so the lease ends with those checks.
+        tokio::select! {
+            result = self.0.sync.head_file(Self::snapshot(&lease.workflow).project, path, if_match) => result,
+            _ = lease.workflow.cancel.cancelled() => Err(AppError::WorkflowPhase("workflow cancelled".into())),
+        }
+    }
+
     pub(crate) async fn finish(&self, id: Uuid) -> Result<WorkflowInfo, AppError> {
         let manager = self.clone();
-        self.managed(async move {
+        self.managed("workflow_finish", id, async move {
             let workflow = manager.workflow(id)?;
             if Self::snapshot(&workflow).status == WorkflowStatus::Completed {
                 return Ok(Self::snapshot(&workflow));
@@ -881,12 +1029,16 @@ impl WorkflowManager {
                 .abort_open(Self::snapshot(&workflow).project)
                 .await
             {
-                workflow
-                    .data
-                    .lock()
-                    .expect("workflow metadata poisoned")
-                    .info
-                    .cleanup_pending = true;
+                tracing::error!(workflow_id = %id, %error, "workflow final sync cleanup failed");
+                manager
+                    .0
+                    .config
+                    .telemetry
+                    .event("workflow_cleanup", "failed");
+                let mut data = workflow.data.lock().expect("workflow metadata poisoned");
+                data.info.cleanup_pending = true;
+                data.info.error_code = Some(error.code().into());
+                data.info.error_message = Some(error.client_message());
                 return Err(error);
             }
             if !manager.terminal(&workflow, &activity, WorkflowStatus::Completed, None, false) {
@@ -899,7 +1051,7 @@ impl WorkflowManager {
 
     pub(crate) async fn cancel(&self, id: Uuid) -> Result<WorkflowInfo, AppError> {
         let manager = self.clone();
-        self.managed(async move {
+        self.managed("workflow_cancel", id, async move {
             let workflow = manager.workflow(id)?;
             manager.request_cleanup(
                 &workflow,
@@ -950,7 +1102,7 @@ impl WorkflowManager {
         if data.info.status.is_terminal() || registry.active != Some(data.info.workflow_id) {
             return;
         }
-        data.info.status = WorkflowStatus::Stopping;
+        self.transition(&mut data, WorkflowStatus::Stopping);
         data.info.cleanup_pending = true;
         data.invalidate_project |= invalidate;
         if invalidate {
@@ -960,6 +1112,21 @@ impl WorkflowManager {
             data.cleanup_target = target;
         }
         if let Some(error) = error {
+            let changed = data
+                .terminal_error
+                .as_ref()
+                .is_none_or(|previous| previous.to_string() != error.to_string());
+            if changed {
+                // Persist only the public diagnostic in WorkflowInfo, but keep
+                // the original cause in the operator log before sanitizing it.
+                if error.status().is_server_error() {
+                    tracing::error!(workflow_id = %data.info.workflow_id, project = %data.info.project,
+                        error_code = error.code(), %error, "workflow failed");
+                } else {
+                    tracing::warn!(workflow_id = %data.info.workflow_id, project = %data.info.project,
+                        error_code = error.code(), %error, "workflow failed");
+                }
+            }
             data.info.error_code = Some(error.code().into());
             data.info.error_message = Some(error.client_message());
             data.terminal_error = Some(error);
@@ -970,19 +1137,50 @@ impl WorkflowManager {
         }
         data.cleanup_started = true;
         data.stop_reason = reason;
+        tracing::info!(workflow_id = %data.info.workflow_id, project = %data.info.project,
+            reason = ?reason, target_status = target.label(), "workflow cleanup requested");
         let manager = self.clone();
         let workflow = workflow.clone();
+        let id = data.info.workflow_id;
+        let span = workflow.span.clone();
         self.0.tasks.spawn(async move {
-            manager.cleanup_workflow(workflow).await;
-        });
+            loop {
+                let worker_manager = manager.clone();
+                let worker_workflow = workflow.clone();
+                let task = tokio::spawn(async move {
+                    worker_manager.cleanup_workflow(worker_workflow).await;
+                }.in_current_span());
+                match task.await {
+                    Ok(()) => break,
+                    Err(error) => {
+                        manager.0.config.telemetry.task_failed("workflow_cleanup");
+                        tracing::error!(%error, "workflow cleanup task failed; retaining ownership");
+                        manager.recover_task_failure(id,
+                            &AppError::Internal(format!("workflow cleanup task failed: {error}")));
+                        if manager.0.background_fault.load(Ordering::Acquire) {
+                            break;
+                        }
+                        manager.0.config.telemetry.event("workflow_cleanup", "retry");
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                    }
+                }
+            }
+        }.instrument(span));
     }
 
     async fn cleanup_workflow(&self, workflow: Arc<Workflow>) {
+        let started = Instant::now();
+        let mut failures = 0_u64;
+        let mut last_error = None;
+        let mut last_report = Instant::now();
         let activity = workflow.activity.write().await;
         loop {
             let info = Self::snapshot(&workflow);
             if info.status.is_terminal() {
                 return;
+            }
+            if failures > 0 {
+                self.0.config.telemetry.event("workflow_cleanup", "retry");
             }
             let (reason, invalidate) = {
                 let data = workflow.data.lock().expect("workflow metadata poisoned");
@@ -1024,14 +1222,41 @@ impl WorkflowManager {
                         continue;
                     }
                     if self.terminal(&workflow, &activity, target, error.as_ref(), !clean) {
+                        self.0.config.telemetry.operation_finished(
+                            "workflow_cleanup",
+                            "completed",
+                            started.elapsed(),
+                        );
+                        if failures > 0 {
+                            self.0
+                                .config
+                                .telemetry
+                                .event("workflow_cleanup", "recovered");
+                            tracing::info!(
+                                failures,
+                                duration_ms = started.elapsed().as_millis() as u64,
+                                "workflow cleanup recovered"
+                            );
+                        }
                         return;
                     }
                 }
                 Err(error) => {
+                    failures += 1;
+                    self.0.config.telemetry.event("workflow_cleanup", "failed");
+                    let diagnostic = error.to_string();
                     let mut data = workflow.data.lock().expect("workflow metadata poisoned");
                     data.info.error_code = Some(error.code().into());
                     data.info.error_message = Some(error.client_message());
-                    tracing::warn!(workflow_id = %data.info.workflow_id, %error, "workflow cleanup will be retried");
+                    if last_error.as_ref() != Some(&diagnostic)
+                        || last_report.elapsed() >= Duration::from_secs(30)
+                    {
+                        tracing::warn!(workflow_id = %data.info.workflow_id, project = %data.info.project,
+                            %error, failures, duration_ms = started.elapsed().as_millis() as u64,
+                            "workflow cleanup will be retried");
+                        last_error = Some(diagnostic);
+                        last_report = Instant::now();
+                    }
                 }
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
@@ -1058,7 +1283,7 @@ impl WorkflowManager {
         if data.invalidate_project && !requires_full_upload {
             return false;
         }
-        data.info.status = status;
+        self.transition(&mut data, status);
         data.info.cleanup_pending = false;
         data.info.requires_full_upload = requires_full_upload;
         data.open_sync = None;
@@ -1066,6 +1291,15 @@ impl WorkflowManager {
         data.info.ended_at = Some(Utc::now());
         data.ended = Some(Instant::now());
         if let Some(error) = error {
+            if data.terminal_error.is_none() {
+                if error.status().is_server_error() {
+                    tracing::error!(workflow_id = %data.info.workflow_id, project = %data.info.project,
+                        error_code = error.code(), %error, "workflow failed before initialization completed");
+                } else {
+                    tracing::warn!(workflow_id = %data.info.workflow_id, project = %data.info.project,
+                        error_code = error.code(), %error, "workflow failed before initialization completed");
+                }
+            }
             data.info.error_code = Some(error.code().into());
             data.info.error_message = Some(error.client_message());
         } else {
@@ -1080,6 +1314,16 @@ impl WorkflowManager {
         if registry.active == Some(data.info.workflow_id) {
             registry.active = None;
         }
+        self.0.config.telemetry.add_active("workflow", -1);
+        self.0.config.telemetry.operation_finished(
+            "workflow",
+            status.label(),
+            data.started.elapsed(),
+        );
+        tracing::info!(workflow_id = %data.info.workflow_id, project = %data.info.project,
+            session_id = ?data.info.session_id, status = status.label(),
+            duration_ms = data.started.elapsed().as_millis() as u64, requires_full_upload,
+            "workflow finished");
         true
     }
 
@@ -1110,6 +1354,16 @@ impl WorkflowManager {
                 && data.heartbeat.elapsed() >= self.0.config.heartbeat_timeout()
         };
         if expired {
+            let data = workflow.data.lock().expect("workflow metadata poisoned");
+            tracing::warn!(workflow_id = %data.info.workflow_id, project = %data.info.project,
+                last_heartbeat_age_ms = data.heartbeat.elapsed().as_millis() as u64,
+                timeout_ms = self.0.config.heartbeat_timeout().as_millis() as u64,
+                "workflow heartbeat expired");
+            self.0
+                .config
+                .telemetry
+                .event("workflow_heartbeat", "expired");
+            drop(data);
             // Heartbeat, completion, and new reservations all need this registry
             // gate, so a stale expiry observation cannot resurrect an old workflow.
             self.request_cleanup_locked(
@@ -1152,13 +1406,20 @@ impl WorkflowManager {
     }
 
     pub(crate) fn is_degraded(&self) -> bool {
-        self.0.sessions.is_degraded() || {
-            let registry = self.0.registry.lock().expect("workflow registry poisoned");
-            registry.entries.values().any(|workflow| {
-                let data = workflow.data.lock().expect("workflow metadata poisoned");
-                data.info.status == WorkflowStatus::Stopping && data.info.error_code.is_some()
-            })
-        }
+        self.0.background_fault.load(Ordering::Acquire)
+            || self.0.sessions.is_degraded()
+            || self.0.sync.is_degraded()
+            || {
+                let Ok(registry) = self.0.registry.lock() else {
+                    return true;
+                };
+                registry.entries.values().any(|workflow| {
+                    let Ok(data) = workflow.data.lock() else {
+                        return true;
+                    };
+                    data.info.cleanup_pending && data.info.error_code.is_some()
+                })
+            }
     }
 
     pub(crate) async fn shutdown(&self) {
@@ -1328,6 +1589,16 @@ mod tests {
             WorkflowStatus::Stopping
         );
         assert!(manager.is_degraded());
+        let pending_metrics = manager.0.config.telemetry.render().unwrap();
+        assert!(
+            pending_metrics.contains(
+                "vivado_server_events_total{kind=\"workflow_cleanup\",outcome=\"failed\"}"
+            )
+        );
+        assert!(
+            !pending_metrics
+                .contains("vivado_server_operations_total{kind=\"workflow\",outcome=\"failed\"}")
+        );
         assert!(matches!(
             manager.create(Uuid::new_v4(), create_request(true)).await,
             Err(AppError::WorkflowBusy)
@@ -1339,6 +1610,16 @@ mod tests {
         assert!(!failed.cleanup_pending);
         assert_eq!(fs::read_to_string(outside).unwrap(), "clean\n");
         assert!(!manager.0.projects.is_clean("demo").await.unwrap());
+        let recovered_metrics = manager.0.config.telemetry.render().unwrap();
+        assert!(recovered_metrics.contains(
+            "vivado_server_events_total{kind=\"workflow_cleanup\",outcome=\"recovered\"} 1\n"
+        ));
+        assert!(
+            recovered_metrics.contains(
+                "vivado_server_operations_total{kind=\"workflow\",outcome=\"failed\"} 1\n"
+            )
+        );
+        assert!(!manager.is_degraded());
         manager.shutdown().await;
     }
 
@@ -1491,5 +1772,161 @@ mod tests {
             manager.get(id).await.unwrap().status,
             WorkflowStatus::Cancelled
         );
+    }
+
+    #[tokio::test]
+    async fn idempotent_requests_count_one_workflow_lifetime() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = manager(&temp).await;
+        let id = Uuid::new_v4();
+        manager.create(id, create_request(true)).await.unwrap();
+        manager.create(id, create_request(true)).await.unwrap();
+        let before = manager.0.config.telemetry.render().unwrap();
+        assert!(before.contains("vivado_server_active{kind=\"workflow\"} 1\n"));
+        assert!(before.contains(
+            "vivado_server_events_total{kind=\"workflow_created\",outcome=\"accepted\"} 1\n"
+        ));
+        manager.cancel(id).await.unwrap();
+        wait_terminal(&manager, id).await;
+        manager.cancel(id).await.unwrap();
+        manager.0.tasks.close();
+        manager.0.tasks.wait().await;
+        let after = manager.0.config.telemetry.render().unwrap();
+        assert!(after.contains("vivado_server_active{kind=\"workflow\"} 0\n"));
+        assert!(after.contains(
+            "vivado_server_operations_total{kind=\"workflow\",outcome=\"cancelled\"} 1\n"
+        ));
+        assert!(after.contains("vivado_server_operation_duration_seconds_count{kind=\"workflow_phase_preparing\",outcome=\"stopping\"} 1\n"));
+        assert!(after.contains("vivado_server_operation_duration_seconds_count{kind=\"workflow_phase_stopping\",outcome=\"cancelled\"} 1\n"));
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn heartbeat_expiry_is_counted_once_while_cleanup_retains_the_slot() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = manager(&temp).await;
+        let id = Uuid::new_v4();
+        manager.create(id, create_request(true)).await.unwrap();
+        let transfer = manager
+            .lease(id, &[WorkflowStatus::Preparing])
+            .await
+            .unwrap();
+        manager.workflow(id).unwrap().data.lock().unwrap().heartbeat =
+            Instant::now() - manager.0.config.heartbeat_timeout();
+        manager.expire_active();
+        manager.expire_active();
+        let metrics = manager.0.config.telemetry.render().unwrap();
+        assert!(metrics.contains(
+            "vivado_server_events_total{kind=\"workflow_heartbeat\",outcome=\"expired\"} 1\n"
+        ));
+        assert!(metrics.contains("vivado_server_active{kind=\"workflow\"} 1\n"));
+        drop(transfer);
+        assert_eq!(
+            wait_terminal(&manager, id).await.status,
+            WorkflowStatus::Cancelled
+        );
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn dropped_http_waiter_cannot_hide_worker_panic_or_release_ownership_early() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = manager(&temp).await;
+        let id = Uuid::new_v4();
+        manager.create(id, create_request(true)).await.unwrap();
+        let transfer = manager
+            .lease(id, &[WorkflowStatus::Preparing])
+            .await
+            .unwrap();
+        let (started, starting) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let worker_manager = manager.clone();
+        let waiter = tokio::spawn(async move {
+            worker_manager
+                .managed::<(), _>("workflow_test_panic", id, async move {
+                    started.send(()).unwrap();
+                    released.await.unwrap();
+                    panic!("injected detached workflow failure");
+                })
+                .await
+        });
+        starting.await.unwrap();
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while manager.get(id).await.unwrap().status != WorkflowStatus::Stopping {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(manager.is_degraded());
+        assert_eq!(
+            manager.get(id).await.unwrap().error_message.as_deref(),
+            Some("internal server error")
+        );
+        assert!(matches!(
+            manager.create(Uuid::new_v4(), create_request(true)).await,
+            Err(AppError::WorkflowBusy)
+        ));
+        let metrics = manager.0.config.telemetry.render().unwrap();
+        assert!(metrics.contains(
+            "vivado_server_background_task_failures_total{task=\"workflow_test_panic\"} 1\n"
+        ));
+        assert!(metrics.contains("vivado_server_active{kind=\"workflow\"} 1\n"));
+        drop(transfer);
+        assert_eq!(
+            wait_terminal(&manager, id).await.status,
+            WorkflowStatus::Failed
+        );
+        assert!(!manager.is_degraded());
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn background_failure_logs_original_cause_without_exposing_it_in_status() {
+        #[derive(Clone)]
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let manager = manager(&temp).await;
+        let id = Uuid::new_v4();
+        manager.create(id, create_request(true)).await.unwrap();
+        let transfer = manager
+            .lease(id, &[WorkflowStatus::Preparing])
+            .await
+            .unwrap();
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let captured = output.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || Capture(captured.clone()))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            manager.fail(
+                &manager.workflow(id).unwrap(),
+                &AppError::Internal("durable clean marker failed: diagnostic-only cause".into()),
+                true,
+            );
+        });
+        let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(logs.contains("durable clean marker failed: diagnostic-only cause"));
+        assert!(logs.contains(&id.to_string()));
+        let info = manager.get(id).await.unwrap();
+        assert_eq!(info.error_message.as_deref(), Some("internal server error"));
+        assert!(manager.is_degraded());
+        drop(transfer);
+        wait_terminal(&manager, id).await;
+        manager.shutdown().await;
     }
 }

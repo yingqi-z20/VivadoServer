@@ -224,6 +224,18 @@ If-Match: "sha256:5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be
 
 `GET /healthz`、`GET /readyz`、`GET /openapi.json` 不认证。就绪检查表示服务协调/清理状态，不启动 Vivado，也不证明许可证可用。应用响应都有 `x-request-id`；401 还包含 `WWW-Authenticate: Bearer`。
 
+正常就绪返回 HTTP 200 和 `{"status":"ready"}`。未就绪返回 HTTP 503、`status:"degraded"` 和非空 `reasons` 数组，原因可以是 `shutting_down`、`workflow_cleanup_failed`、`background_task_failed` 中的一个或多个。`failed_tasks` 非空时才返回，标明异常结束的受监督后台任务。例如：
+
+```json
+{
+  "status": "degraded",
+  "reasons": ["background_task_failed"],
+  "failed_tasks": ["workflow_reaper"]
+}
+```
+
+缺少可选数组不是错误，客户端应兼容未来新增的原因和任务名称。`GET /metrics` 返回 Prometheus 文本，使用与工作流 API 相同的 Bearer 认证。该接口默认启用；设置 `observability.metrics_enabled=false` 后移除路由，无 token 请求也返回 404。它供运维观测使用，不替代工作流状态查询。
+
 ```json
 {
   "error": {
@@ -236,6 +248,8 @@ If-Match: "sha256:5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be
 ```
 
 `details` 始终是对象；上报问题时记录 request ID。通过 code 区分 workflow 阶段冲突、工程重传和同步冲突，不要解析供人阅读的 message 决定业务分支。
+
+客户端诊断还应记录 `workflow_id`、`session_id` 和 `sync_id`，便于定位请求结束后继续执行的后台操作。服务端 HTTP 完成指标只表示响应体已交给传输层，客户端仍须校验下载。可选的服务端 PTY 归档不延长 API 输出留存、不恢复过期游标，也不恢复重启前的 workflow ID。运维检索和归档完整性检查见 [日志与可观测性指南](observability.md)。
 
 | HTTP 状态 | 含义 |
 |---|---|

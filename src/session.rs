@@ -5,7 +5,12 @@ mod output;
 mod process;
 mod supervisor;
 
-use crate::{config::RuntimeConfig, error::AppError};
+use crate::{
+    config::RuntimeConfig,
+    diagnostics::{Diagnostics, OutputArchive},
+    error::AppError,
+    observability::Observability,
+};
 use chrono::Utc;
 pub use model::*;
 use output::OutputBuffer;
@@ -13,12 +18,13 @@ use std::{
     collections::HashMap,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
 use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
+use tracing::Instrument;
 use uuid::Uuid;
 
 const MAX_VIVADO_ARGS: usize = 128;
@@ -32,6 +38,7 @@ pub struct SessionManager {
 
 struct Manager {
     config: RuntimeConfig,
+    diagnostics: Diagnostics,
     state: Mutex<ManagerState>,
     tasks: TaskTracker,
     degraded: AtomicBool,
@@ -45,6 +52,14 @@ struct ManagerState {
 }
 
 struct Session {
+    id: Uuid,
+    project: String,
+    pid: AtomicI32,
+    started: Instant,
+    telemetry: Observability,
+    archive: Mutex<Option<OutputArchive>>,
+    output_bytes: AtomicU64,
+    evicted_chunks: AtomicU64,
     data: AsyncMutex<SessionData>,
     inputs: mpsc::Sender<Input>,
     input_budget: Arc<Semaphore>,
@@ -68,10 +83,16 @@ struct Input {
 }
 
 impl SessionManager {
+    #[cfg(test)]
     pub(crate) fn new(config: RuntimeConfig) -> Self {
+        Self::new_with_diagnostics(config, Diagnostics::disabled())
+    }
+
+    pub(crate) fn new_with_diagnostics(config: RuntimeConfig, diagnostics: Diagnostics) -> Self {
         Self {
             shared: Arc::new(Manager {
                 config,
+                diagnostics,
                 state: Mutex::new(ManagerState::default()),
                 tasks: TaskTracker::new(),
                 degraded: AtomicBool::new(false),
@@ -91,6 +112,14 @@ impl SessionManager {
         let id = Uuid::new_v4();
         let (inputs, receiver) = mpsc::channel(INPUT_QUEUE_LENGTH);
         let session = Arc::new(Session {
+            id,
+            project: request.project.clone(),
+            pid: AtomicI32::new(0),
+            started: Instant::now(),
+            telemetry: self.shared.config.telemetry.clone(),
+            archive: Mutex::new(None),
+            output_bytes: AtomicU64::new(0),
+            evicted_chunks: AtomicU64::new(0),
             data: AsyncMutex::new(SessionData {
                 info: SessionInfo {
                     session_id: id,
@@ -131,10 +160,20 @@ impl SessionManager {
             }
             state.active = Some(id);
             state.sessions.insert(id, session.clone());
+            self.shared.config.telemetry.add_active("session", 1);
             let manager = self.shared.clone();
-            self.shared.tasks.spawn(async move {
-                supervisor::run(manager, session, receiver, request, started).await;
-            });
+            let span =
+                tracing::info_span!("vivado_session", session_id = %id, project = %request.project);
+            self.shared.tasks.spawn(
+                async move {
+                    let info = session.snapshot().await;
+                    *session.archive.lock().unwrap_or_else(|e| e.into_inner()) =
+                        manager.diagnostics.start(&info);
+                    tracing::info!("Vivado session accepted");
+                    supervisor::run(manager, session, receiver, request, started).await;
+                }
+                .instrument(span),
+            );
         }
         result
             .await
@@ -278,6 +317,7 @@ impl SessionManager {
 
 impl Manager {
     fn prune(&self, state: &mut ManagerState) {
+        let before = state.sessions.len();
         let retention = Duration::from_secs(self.config.workflow_retention_secs);
         state.sessions.retain(|_, session| {
             session
@@ -304,6 +344,11 @@ impl Manager {
         for (id, _) in terminal.into_iter().take(remove_count) {
             state.sessions.remove(&id);
         }
+        let removed = before.saturating_sub(state.sessions.len());
+        if removed > 0 {
+            tracing::debug!(sessions = removed, "released retained session state");
+            self.config.telemetry.event("session_retention", "pruned");
+        }
     }
 
     fn finished(&self, id: Uuid) {
@@ -329,10 +374,15 @@ impl Session {
     }
 
     fn request_stop(&self, reason: TerminationReason) {
-        self.stop_reason
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get_or_insert(reason);
+        let mut stop_reason = self.stop_reason.lock().unwrap_or_else(|e| e.into_inner());
+        if stop_reason.is_none() && !self.terminal.load(Ordering::Acquire) {
+            *stop_reason = Some(reason);
+            tracing::info!(session_id = %self.id, project = %self.project,
+                pid = self.pid.load(Ordering::Acquire), reason = reason.label(),
+                "Vivado session stop requested");
+            self.telemetry.event("session_stop", reason.label());
+        }
+        drop(stop_reason);
         self.stop.cancel();
     }
 
@@ -357,15 +407,42 @@ impl Session {
         if text.is_empty() {
             return;
         }
+        self.output_bytes
+            .fetch_add(text.len() as u64, Ordering::Relaxed);
+        self.telemetry
+            .add_bytes("session_output", text.len() as u64);
+        if let Some(archive) = self
+            .archive
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            archive.push(&text);
+        }
         let mut data = self.data.lock().await;
         debug_assert!(!data.info.status.is_terminal());
-        data.output.push(text);
+        let (_, _, evicted) = data.output.push(text);
+        if evicted > 0 {
+            let previous = self
+                .evicted_chunks
+                .fetch_add(evicted as u64, Ordering::Relaxed);
+            if previous == 0 {
+                tracing::warn!(session_id = %self.id, project = %self.project,
+                    "session output exceeded in-memory history; earlier output is available only in diagnostics if captured");
+                self.telemetry.event("session_output", "history_evicted");
+            }
+        }
         drop(data);
         self.changed.notify_waiters();
     }
 
     async fn stopping(&self, reason: TerminationReason) {
         let mut data = self.data.lock().await;
+        if data.info.status != SessionStatus::Stopping {
+            tracing::info!(session_id = %self.id, project = %self.project,
+                pid = self.pid.load(Ordering::Acquire), reason = reason.label(),
+                "Vivado session stopping");
+        }
         data.info.status = SessionStatus::Stopping;
         data.info.termination_reason.get_or_insert(reason);
         drop(data);
@@ -388,8 +465,43 @@ impl Session {
         data.info.output_truncated = truncated;
         data.info.cleanup_error = None;
         self.terminal.store(true, Ordering::Release);
+        let info = data.info.clone();
         drop(data);
         self.changed.notify_waiters();
+        self.telemetry.add_active("session", -1);
+        if let Some(code) = code {
+            self.telemetry
+                .event("session_exit", if code == 0 { "zero" } else { "nonzero" });
+        }
+        self.telemetry
+            .operation_finished("session", reason.label(), self.started.elapsed());
+        tracing::info!(session_id = %self.id, project = %self.project,
+            pid = self.pid.load(Ordering::Acquire), reason = reason.label(), exit_code = ?code,
+            duration_ms = self.started.elapsed().as_millis() as u64,
+            output_bytes = self.output_bytes.load(Ordering::Relaxed),
+            evicted_chunks = self.evicted_chunks.load(Ordering::Relaxed),
+            output_truncated = truncated, "Vivado session finished");
+        if let Some(archive) = self
+            .archive
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            // Disk finalization must never add an await between publishing a
+            // terminal session and releasing its manager's active slot.
+            archive.seal(info);
+        }
+    }
+
+    async fn drain_archive(&self) {
+        let archive = self
+            .archive
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(archive) = archive {
+            archive.wait().await;
+        }
     }
 }
 
@@ -512,6 +624,57 @@ mod tests {
         assert!(session.retained_since.lock().unwrap().is_none());
         manager.release_session(info.session_id).unwrap();
         assert!(session.retained_since.lock().unwrap().is_some());
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn stalled_diagnostics_drain_does_not_hold_the_next_session_slot() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("fake-vivado");
+        std::fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (config, _) = crate::config::AppConfig {
+            vivado_path: executable,
+            workspace_root: temp.path().to_path_buf(),
+            auth_tokens: vec!["0123456789abcdef0123456789abcdef".into()],
+            allow_run_as_root: true,
+            ..crate::config::AppConfig::default()
+        }
+        .into_runtime()
+        .unwrap();
+        let (diagnostics, _stalled_writer) =
+            Diagnostics::stalled_for_test(config.telemetry.clone());
+        let manager = SessionManager::new_with_diagnostics(config, diagnostics);
+        let first = manager
+            .create_session(CreateSessionRequest {
+                project: "first".into(),
+                args: vec![],
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            manager.session(first.session_id).unwrap().wait_terminal(),
+        )
+        .await
+        .unwrap();
+        // The current-thread test has resumed only after the supervisor reaches
+        // its archive drain await; that wait must not retain the manager slot.
+        assert!(!manager.shared.tasks.is_empty());
+        let second = manager
+            .create_session(CreateSessionRequest {
+                project: "second".into(),
+                args: vec![],
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            manager.session(second.session_id).unwrap().wait_terminal(),
+        )
+        .await
+        .unwrap();
         manager.shutdown().await;
     }
 }

@@ -44,6 +44,18 @@ Session state distinguishes `running`, `stopping`, `exited`, `terminated`, and `
 
 The output reader incrementally decodes UTF-8 and fills a byte-bounded ring. Cursors identify output chunks, not byte positions. `overrun` means requested history was evicted; `output_truncated` also exposes final drain truncation. Clients must concatenate chunks as a stream, since prompts, lines, and UTF-8 reads need not align with chunk boundaries. Output notification is registered before inspecting the buffer to avoid missed wakeups.
 
+Decoded PTY output can also be copied to `<workspace>/.vivado-server/diagnostics/<session_id>.jsonl`. A bounded queue and a dedicated writer keep archive I/O out of PTY backpressure. JSONL headers and footers identify the session and distinguish process-output truncation from archive loss. The archive limits include record overhead, and retention excludes active sessions. Files survive restart, but workflow/session registries, sync results, and API cursors remain process-local. This best-effort diagnostic store is neither a transaction journal nor a durable client replay API. Archive initialization/write/retention failures are logged and counted without declaring the process successfully cleaned up or blocking PTY reads.
+
+## Observability boundaries
+
+Each runtime owns its metrics registry. `GET /metrics` uses the normal bearer authentication and is omitted entirely when disabled. Metric dimensions use fixed operation/outcome names and route templates; client identifiers, projects, file paths, token values, and raw URLs are never metric labels. Counters restart with the process. See the [observability runbook](observability.md) for exact metric names and deployment examples.
+
+Request spans are INFO and contain the generated request ID, method, and normalized route. Domain spans and events carry workflow, session, and sync identities, including accepted work continuing after an HTTP waiter disappears. Routine business request completions are INFO, client failures/aborts WARN, and server/body failures ERROR; successful health and metrics requests are DEBUG. Internal errors remain available in service logs while the API keeps its existing sanitized error contract. Routine request logs do not include authorization headers, query strings, request bodies, Tcl stdin, or raw PTY text.
+
+HTTP header latency ends when the handler generates the response. Response latency and in-flight ownership extend through the body; dropped or failed bodies are measured separately from complete bodies. Completion and byte counts mean data was handed to the HTTP transport, not acknowledged by the client. The client must still verify download size and hash. Accepted mutation duration has its own domain metric and may continue beyond request cancellation.
+
+`/healthz` checks HTTP liveness. `/readyz` and the readiness gauge check shutdown, workflow/session/sync cleanup health, and unexpected supervised background-task exits. They do not test Vivado startup, licenses, disk capacity, or whether optional logging/archiving collectors keep up. Monitor those failure counters and host storage independently. The stdout logger and PTY writer use separate bounded queues; loss is observable, but neither is a lossless audit channel or an OpenTelemetry exporter.
+
 ## Transfers and locking
 
 Workflow metadata locks do not span filesystem, process, or network I/O. Activity leases protect transfers from phase transitions; streamed downloads retain their lease until the response body finishes or is dropped. Finish rejects active leases. Cancellation wakes transfers before waiting for them. The admission gate and manager task registration share shutdown ordering, preventing new accepted mutations after the shutdown barrier.

@@ -71,6 +71,18 @@ fn paths() -> Value {
     let mut paths = json!({
         "/healthz": {"get": public_operation("Process health", "HealthResponse")},
         "/readyz": {"get": public_operation("Readiness; 503 while stopping or degraded", "ReadyResponse")},
+        "/metrics": {"get": {
+            "summary": "Read Prometheus metrics",
+            "description": "Requires the same bearer authentication as the workflow API. Returns 404 when observability.metrics_enabled is false. Labels use route templates and fixed operation names; request IDs, user paths and project names are excluded. Request latency ends at generated response headers; response latency and in-flight gauges extend through body exhaustion, error, or drop. Bytes represent data yielded to HTTP transport, not client acknowledgement.",
+            "security": [{"bearerAuth": []}],
+            "responses": {
+                "200": {"description": "Prometheus text exposition", "headers": request_id_headers(), "content": {"text/plain": {"schema": {"type": "string"}}}},
+                "401": error_response("Bearer authentication required", false),
+                "404": error_response("Metrics are disabled", false),
+                "405": error_response("Method not allowed", true),
+                "500": error_response("Metrics encoding failed", false)
+            }
+        }},
         "/openapi.json": {"get": {
             "summary": "Read the public OpenAPI document", "security": [],
             "responses": {
@@ -127,6 +139,8 @@ fn paths() -> Value {
         "ReadyResponse",
         "Stopping or degraded; the response remains a readiness status object",
     );
+    paths["/metrics"]["get"]["responses"]["401"]["headers"]["WWW-Authenticate"] =
+        json!({"schema": {"type": "string", "enum": ["Bearer"]}});
     paths["/v1/workflows/{workflow_id}/session/output"]["get"]["parameters"] = json!([
         {"name": "cursor", "in": "query", "required": false, "schema": {"type": "integer", "format": "uint64", "minimum": 0, "default": 0}},
         {"name": "timeout_ms", "in": "query", "required": false, "description": "Default 30000 milliseconds; values above 60000 are clamped to 60000.", "schema": {"type": "integer", "format": "uint64", "minimum": 0, "default": 30000}}
@@ -291,7 +305,7 @@ mod tests {
         for declaration in include_str!("api.rs").split(".route(").skip(1) {
             let declaration = declaration.trim_start().strip_prefix('"').unwrap();
             let (path, rest) = declaration.split_once('"').unwrap();
-            let path = if ["/healthz", "/readyz", "/openapi.json"].contains(&path) {
+            let path = if ["/healthz", "/readyz", "/openapi.json", "/metrics"].contains(&path) {
                 path.to_string()
             } else {
                 format!("/v1{path}")
@@ -359,6 +373,10 @@ mod tests {
                     operation["responses"]["401"]["headers"]["WWW-Authenticate"]["schema"]["enum"],
                     json!(["Bearer"])
                 );
+            } else if path == "/metrics" {
+                assert_eq!(operation["security"], json!([{"bearerAuth": []}]));
+                assert!(operation["responses"]["401"].is_object());
+                assert!(operation["responses"]["404"].is_object());
             } else {
                 assert_eq!(operation["security"], json!([]));
                 assert!(operation["responses"].get("401").is_none());

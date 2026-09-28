@@ -1,0 +1,106 @@
+rule_files:
+  - alerts.yml
+evaluation_interval: 1m
+
+tests:
+  # Lifetime signals must catch failures that predate the first scrape.
+  - interval: 1m
+    input_series:
+      - series: 'up{job="vivado-server",instance="test"}'
+        values: '0+0x5'
+      - series: 'vivado_server_ready{job="vivado-server",instance="test"}'
+        values: '0+0x5'
+      - series: 'vivado_server_background_task_failures_total{job="vivado-server",instance="test",task="workflow_reaper"}'
+        values: '1+0x5'
+      - series: 'vivado_server_events_total{job="vivado-server",instance="test",kind="archive",outcome="initialization_failed"}'
+        values: '1+0x5'
+      - series: 'vivado_server_log_dropped_messages{job="vivado-server",instance="test"}'
+        values: '1+0x5'
+    promql_expr_test:
+      - expr: count(ALERTS{alertstate="firing",alertname=~"VivadoServerScrapeFailed|VivadoServerNotReady|VivadoServerBackgroundTaskFailed|VivadoServerArchiveLoss|VivadoServerLogLoss"})
+        eval_time: 3m
+        exp_samples:
+          - labels: '{}'
+            value: 5
+
+  # Heavy excluded traffic must not turn a low-volume sample into an HTTP SLO.
+  - interval: 1m
+    input_series:
+      - series: 'vivado_server_http_requests_total{job="vivado-server",instance="test",method="GET",route="/v1/workflows/{workflow_id}",status="200"}'
+        values: '0+1x15'
+      - series: 'vivado_server_http_requests_total{job="vivado-server",instance="test",method="GET",route="/v1/workflows/{workflow_id}",status="500"}'
+        values: '0+1x15'
+      - series: 'vivado_server_http_requests_total{job="vivado-server",instance="test",method="GET",route="/v1/workflows/{workflow_id}/session/output",status="500"}'
+        values: '0+100x15'
+      - series: 'vivado_server_http_requests_total{job="vivado-server",instance="test",method="GET",route="/v1/workflows/{workflow_id}/sync/files/{path}",status="500"}'
+        values: '0+100x15'
+      - series: 'vivado_server_http_requests_total{job="vivado-server",instance="test",method="PUT",route="/v1/workflows/{workflow_id}/sync/{sync_id}/files/{path}",status="500"}'
+        values: '0+100x15'
+      - series: 'vivado_server_http_requests_total{job="vivado-server",instance="test",method="GET",route="/readyz",status="503"}'
+        values: '0+100x15'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: VivadoServerHttpErrors
+        exp_alerts: []
+
+  # Errors from an ordinary route must trigger once volume and duration suffice.
+  - interval: 1m
+    input_series:
+      - series: 'vivado_server_http_requests_total{job="vivado-server",instance="test",method="GET",route="/v1/workflows/{workflow_id}",status="200"}'
+        values: '0+90x15'
+      - series: 'vivado_server_http_requests_total{job="vivado-server",instance="test",method="GET",route="/v1/workflows/{workflow_id}",status="500"}'
+        values: '0+10x15'
+    promql_expr_test:
+      - expr: ALERTS{alertname="VivadoServerHttpErrors",alertstate="firing"}
+        eval_time: 10m
+        exp_samples:
+          - labels: 'ALERTS{alertname="VivadoServerHttpErrors",alertstate="firing",job="vivado-server",instance="test",severity="warning"}'
+            value: 1
+
+  # A 15-second P95 is expected for long polls and must not fire control latency.
+  - interval: 1m
+    input_series:
+      - series: 'vivado_server_http_request_duration_seconds_bucket{job="vivado-server",instance="test",method="GET",route="/v1/workflows/{workflow_id}/session/output",status="200",le="5"}'
+        values: '0+0x15'
+      - series: 'vivado_server_http_request_duration_seconds_bucket{job="vivado-server",instance="test",method="GET",route="/v1/workflows/{workflow_id}/session/output",status="200",le="15"}'
+        values: '0+100x15'
+      - series: 'vivado_server_http_request_duration_seconds_bucket{job="vivado-server",instance="test",method="GET",route="/v1/workflows/{workflow_id}/session/output",status="200",le="+Inf"}'
+        values: '0+100x15'
+      - series: 'vivado_server_http_request_duration_seconds_count{job="vivado-server",instance="test",method="GET",route="/v1/workflows/{workflow_id}/session/output",status="200"}'
+        values: '0+100x15'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: VivadoServerControlLatency
+        exp_alerts: []
+
+  # The same latency on status GET is an actionable control-plane delay.
+  - interval: 1m
+    input_series:
+      - series: 'vivado_server_http_request_duration_seconds_bucket{job="vivado-server",instance="test",method="GET",route="/v1/workflows/{workflow_id}",status="200",le="5"}'
+        values: '0+0x15'
+      - series: 'vivado_server_http_request_duration_seconds_bucket{job="vivado-server",instance="test",method="GET",route="/v1/workflows/{workflow_id}",status="200",le="15"}'
+        values: '0+100x15'
+      - series: 'vivado_server_http_request_duration_seconds_bucket{job="vivado-server",instance="test",method="GET",route="/v1/workflows/{workflow_id}",status="200",le="+Inf"}'
+        values: '0+100x15'
+      - series: 'vivado_server_http_request_duration_seconds_count{job="vivado-server",instance="test",method="GET",route="/v1/workflows/{workflow_id}",status="200"}'
+        values: '0+100x15'
+    promql_expr_test:
+      - expr: ALERTS{alertname="VivadoServerControlLatency",alertstate="firing"}
+        eval_time: 10m
+        exp_samples:
+          - labels: 'ALERTS{alertname="VivadoServerControlLatency",alertstate="firing",job="vivado-server",instance="test",severity="warning"}'
+            value: 1
+
+  # Failed bodies and a cleanup backlog are visible independently of header 5xx.
+  - interval: 1m
+    input_series:
+      - series: 'vivado_server_http_responses_total{job="vivado-server",instance="test",method="GET",route="/v1/workflows/{workflow_id}/sync/files/{path}",status="200",outcome="body_error"}'
+        values: '0+1x5'
+      - series: 'vivado_server_active{job="vivado-server",instance="test",kind="sync_cleanup_pending"}'
+        values: '1+0x5'
+    promql_expr_test:
+      - expr: count(ALERTS{alertstate="firing",alertname=~"VivadoServerResponseBodyFailed|VivadoServerCleanupTrouble"})
+        eval_time: 3m
+        exp_samples:
+          - labels: '{}'
+            value: 2

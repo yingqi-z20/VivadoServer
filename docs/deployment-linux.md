@@ -104,7 +104,13 @@ sudo journalctl -u vivado-server -f
 curl --fail http://127.0.0.1:8080/readyz
 ```
 
-Inspect the JSON readiness status as well as the HTTP result. A healthy coordination layer does not prove a project is reusable or Vivado can start.
+Inspect the JSON readiness status as well as the HTTP result. Healthy readiness is HTTP 200 with `{"status":"ready"}`. HTTP 503 includes `status:"degraded"` and `reasons`; `failed_tasks` is present when supervised background tasks have failed. A healthy coordination layer does not prove a project is reusable or Vivado can start.
+
+The default logger writes JSON to stdout, which this unit sends to journald. Configure journald persistence, disk quotas, forwarding, and retention according to your host policy; the service does not rotate or persist its stdout itself. `journalctl -u vivado-server -o cat` exposes each original JSON record for `jq`. Check `vivado_server_log_dropped_messages`: a slow collector can overflow the service's bounded 4096-message queue. Configuration errors before logging initializes and Rust's original panic/backtrace output may still appear as plain stderr text.
+
+The default `[observability]` settings also enable an authenticated `/metrics` endpoint and bounded PTY archives at `/srv/vivado-server/workspaces/.vivado-server/diagnostics/<session_id>.jsonl`. The directory is created with mode 0700 and files with mode 0600. The unit's existing `ReadWritePaths` covers them. Reserve disk space for archives in addition to projects and staging; limits cover server-owned archive files, not the whole workspace or foreign files. Set `archive_output=false` if tool output must not be retained. This stops new archives but does not remove existing files.
+
+Use the [observability runbook](observability.md) for request/workflow/session correlation, archive loss, and Prometheus queries. A [scrape configuration](../deploy/observability/prometheus.yml) and [alert rules](../deploy/observability/alerts.yml) are supplied, but no Prometheus, Alertmanager, or Grafana service is installed by VivadoServer. The scrape credential has the same administrative API access as any configured token. Provision its source file for the VivadoServer account and a separate restricted copy for the Prometheus account; do not make the API token file group-readable to share it. Configure HTTPS and CA verification when scraping across a network.
 
 ## 5. Validate the actual installation
 
@@ -136,6 +142,8 @@ systemd-cgls /system.slice/vivado-server.service
 Unattended restart is supported through the systemd unit above: its control group must remove the previous Vivado descendants before a replacement server starts. If running the binary directly, stop and verify the old Vivado process group before restarting after an abrupt server death. The workspace file lock excludes another server instance; it does not prove that a former instance's descendants have exited.
 
 A project is reusable only when both its real directory and a durable clean marker exist. New projects, missing/unknown markers, interrupted mutation, and abnormal Vivado execution require a full client upload. A process restart also discards retained workflow and sync IDs; reconnect using a new workflow ID.
+
+PTY diagnostic archives survive restart until retention removes them. They are best-effort diagnostics, not transaction recovery: check for a final `finished` record and its `archive_truncated`/`output_truncated` flags. Missing or incomplete archives do not certify a successful build. Preserve the relevant archive and service logs before repair; neither changes whether the project has a valid clean marker.
 
 Recovery is a client operation: create a workflow with `reset_project:true`, send the complete unfiltered manifest, upload every planned file, and commit. The full replacement discards old project files absent from the manifest. Keep the trusted source independently of the service workspace.
 

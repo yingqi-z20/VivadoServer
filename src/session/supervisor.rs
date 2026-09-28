@@ -24,6 +24,7 @@ const CLEANUP_DEADLINE: Duration = Duration::from_secs(8);
 
 struct SupervisorGuard {
     manager: Arc<Manager>,
+    session: Arc<Session>,
     complete: bool,
 }
 impl Drop for SupervisorGuard {
@@ -31,6 +32,26 @@ impl Drop for SupervisorGuard {
         if !self.complete {
             // A panic/runtime teardown must not silently release the active slot.
             self.manager.degraded.store(true, Ordering::Release);
+            tracing::error!(
+                event = "session_supervisor_aborted",
+                session_id = %self.session.id,
+                project = %self.session.project,
+                pid = self.session.pid.load(Ordering::Acquire),
+                panicking = std::thread::panicking(),
+                "Session supervisor ended without confirming process cleanup; capacity remains reserved"
+            );
+            self.session
+                .telemetry
+                .event("session_supervisor", "aborted");
+            if !self.session.terminal.load(Ordering::Acquire) {
+                // The manager still reserves this session until process death
+                // can be confirmed. Keep the active-resource gauge elevated.
+                self.session.telemetry.operation_finished(
+                    "session",
+                    "aborted",
+                    self.session.started.elapsed(),
+                );
+            }
         }
     }
 }
@@ -44,6 +65,7 @@ pub(super) async fn run(
 ) {
     let mut guard = SupervisorGuard {
         manager: manager.clone(),
+        session: session.clone(),
         complete: false,
     };
     let id = session.snapshot().await.session_id;
@@ -51,6 +73,7 @@ pub(super) async fn run(
     {
         Ok(path) => path,
         Err(error) => {
+            tracing::error!(event = "session_start_failed", session_id = %session.id, project = %session.project, %error, "Cannot prepare Vivado project directory");
             session
                 .finish(TerminationReason::ProcessStartFailed, None, false)
                 .await;
@@ -58,10 +81,12 @@ pub(super) async fn run(
             manager.finished(id);
             guard.complete = true;
             let _ = started.send(Err(error));
+            session.drain_archive().await;
             return;
         }
     };
     if started.is_closed() || session.stop.is_cancelled() {
+        tracing::info!(event = "session_start_cancelled", session_id = %session.id, project = %session.project, "Session was stopped before process startup");
         session
             .finish(
                 if session.stop.is_cancelled() {
@@ -77,16 +102,25 @@ pub(super) async fn run(
         manager.finished(id);
         guard.complete = true;
         let _ = started.send(Err(AppError::SessionNotRunning));
+        session.drain_archive().await;
         return;
     }
     let path = manager.config.vivado_path.clone();
     // This task is manager-owned. HTTP cancellation cannot detach the spawn
     // result or run cleanup before the blocking startup has actually finished.
-    let spawned =
-        tokio::task::spawn_blocking(move || process::spawn(path, request.args, directory)).await;
+    let startup_span = tracing::info_span!(
+        "vivado_startup",
+        session_id = %session.id,
+        project = %session.project,
+    );
+    let spawned = tokio::task::spawn_blocking(move || {
+        startup_span.in_scope(|| process::spawn(path, request.args, directory))
+    })
+    .await;
     let (process, master) = match spawned {
         Ok(Ok(value)) => value,
         Ok(Err(error)) => {
+            tracing::error!(event = "session_start_failed", session_id = %session.id, project = %session.project, error = %format!("{error:#}"), "Cannot start Vivado process");
             session
                 .finish(TerminationReason::ProcessStartFailed, None, false)
                 .await;
@@ -96,9 +130,11 @@ pub(super) async fn run(
             let _ = started.send(Err(AppError::Internal(format!(
                 "failed to start Vivado: {error:#}"
             ))));
+            session.drain_archive().await;
             return;
         }
         Err(error) => {
+            tracing::error!(event = "session_start_task_failed", session_id = %session.id, project = %session.project, %error, "Vivado startup task failed before process ownership could be confirmed");
             // A panicking spawn has no trustworthy result. Keep the slot for
             // operator recovery rather than assume it never created a child.
             session
@@ -116,6 +152,8 @@ pub(super) async fn run(
             return;
         }
     };
+    session.pid.store(process.pid, Ordering::Release);
+    tracing::info!(event = "session_process_started", session_id = %session.id, project = %session.project, pid = process.pid, "Vivado process started");
     let mut started = Some(started);
     let mut startup_error = None;
     let mut unclaimed = false;
@@ -128,11 +166,16 @@ pub(super) async fn run(
                 .is_err()
             {
                 unclaimed = true;
+                tracing::info!(event = "session_start_unclaimed", session_id = %session.id, project = %session.project, pid = process.pid, "Startup caller disconnected; stopping unclaimed process");
                 session.request_stop(TerminationReason::ClientRequested);
             }
             Some(fd)
         }
         Err(error) => {
+            tracing::error!(event = "session_output_registration_failed", session_id = %session.id, project = %session.project, pid = process.pid, %error, "Cannot register Vivado PTY for asynchronous output");
+            session
+                .telemetry
+                .event("session_output", "registration_failed");
             session.request_stop(TerminationReason::OutputReadFailed);
             startup_error = Some(AppError::Internal(format!(
                 "failed to register PTY: {error}"
@@ -151,6 +194,7 @@ pub(super) async fn run(
             startup_error.expect("unsent startup response has an error")
         ));
     }
+    session.drain_archive().await;
 }
 
 struct Stop {
@@ -235,7 +279,8 @@ async fn supervise(
             Event::Read(Err(error)) => {
                 reader_done = true;
                 truncated = true;
-                tracing::warn!(%error, pid = process.pid, "PTY output failed");
+                tracing::warn!(event = "session_output_read_failed", session_id = %session.id, project = %session.project, %error, pid = process.pid, "PTY output failed");
+                session.telemetry.event("session_output", "read_failed");
                 session.request_stop(TerminationReason::OutputReadFailed);
                 if let Some(stop) = stop.as_mut()
                     && stop.reason == TerminationReason::ProcessExited
@@ -244,6 +289,7 @@ async fn supervise(
                 }
             }
             Event::Written(Ok(count)) => {
+                session.telemetry.add_bytes("session_input", count as u64);
                 if let Some(input) = pending.as_mut() {
                     input.offset += count;
                     if input.offset == input.bytes.len()
@@ -254,6 +300,8 @@ async fn supervise(
                 }
             }
             Event::Written(Err(error)) => {
+                tracing::warn!(event = "session_input_write_failed", session_id = %session.id, project = %session.project, pid = process.pid, %error, "PTY input failed");
+                session.telemetry.event("session_input", "write_failed");
                 if let Some(input) = pending.take() {
                     let _ = input.completion.send(Err(AppError::Internal(format!(
                         "PTY input failed: {error}"
@@ -265,6 +313,8 @@ async fn supervise(
                 if let Some(reaped) = reaped_at {
                     if !reader_done && reaped.elapsed() >= DRAIN_GRACE {
                         // Seal the stream explicitly; terminal output never grows.
+                        tracing::warn!(event = "session_output_drain_timeout", session_id = %session.id, project = %session.project, pid = process.pid, grace_ms = DRAIN_GRACE.as_millis() as u64, "PTY output did not close before drain deadline; output is truncated");
+                        session.telemetry.event("session_output", "drain_timeout");
                         truncated = true;
                         reader_done = true;
                         fd.take();
@@ -274,6 +324,7 @@ async fn supervise(
                 if !leader_exited {
                     match process.observe_exit() {
                         Ok(true) => {
+                            tracing::debug!(event = "session_leader_exited", session_id = %session.id, project = %session.project, pid = process.pid, "Vivado leader exited; confirming process group cleanup");
                             leader_exited = true;
                             if stop.is_none() {
                                 stop = Some(Stop::new(TerminationReason::ProcessExited));
@@ -302,6 +353,7 @@ async fn supervise(
                         match process.signal_group(libc::SIGTERM) {
                             Ok(()) => {
                                 stop.term_sent = true;
+                                tracing::debug!(event = "session_group_term_sent", session_id = %session.id, project = %session.project, pid = process.pid, "Sent SIGTERM to Vivado process group");
                             }
                             Err(error) => {
                                 report_cleanup_error(
@@ -318,6 +370,7 @@ async fn supervise(
                             .last_kill
                             .is_none_or(|last| last.elapsed() >= Duration::from_secs(1))
                     {
+                        let first_kill = stop.last_kill.is_none();
                         stop.last_kill = Some(Instant::now());
                         if let Err(error) = process.signal_group(libc::SIGKILL) {
                             report_cleanup_error(
@@ -326,6 +379,9 @@ async fn supervise(
                                 format!("cannot kill Vivado group: {error}"),
                             )
                             .await;
+                        } else if first_kill {
+                            tracing::warn!(event = "session_group_kill_sent", session_id = %session.id, project = %session.project, pid = process.pid, elapsed_ms = elapsed.as_millis() as u64, "Vivado group did not stop during grace period; sent SIGKILL");
+                            session.telemetry.event("session_cleanup", "kill_required");
                         }
                     }
                     if elapsed >= CLEANUP_DEADLINE {
@@ -334,8 +390,11 @@ async fn supervise(
                 }
                 if leader_exited && stop.as_ref().is_some_and(|stop| stop.term_sent) {
                     let pgid = process.pid;
-                    match tokio::task::spawn_blocking(move || process::group_has_live_members(pgid))
-                        .await
+                    let span = tracing::Span::current();
+                    match tokio::task::spawn_blocking(move || {
+                        span.in_scope(|| process::group_has_live_members(pgid))
+                    })
+                    .await
                     {
                         Ok(Ok(false)) => {
                             // /proc enumeration is not an atomic snapshot: a
@@ -351,13 +410,15 @@ async fn supervise(
                                 .await;
                                 continue;
                             }
+                            let span = tracing::Span::current();
                             match tokio::task::spawn_blocking(move || {
-                                process::group_has_live_members(pgid)
+                                span.in_scope(|| process::group_has_live_members(pgid))
                             })
                             .await
                             {
                                 Ok(Ok(false)) => match process.reap() {
                                     Ok(code) => {
+                                        tracing::debug!(event = "session_process_reaped", session_id = %session.id, project = %session.project, pid = process.pid, exit_code = code, "Vivado process group is stopped and leader reaped");
                                         exit_code = Some(code);
                                         reaped_at = Some(Instant::now());
                                     }
@@ -415,6 +476,10 @@ async fn supervise(
     fd.take();
     session.push_output(decoder.finish()).await;
     let reason = stop.map_or(TerminationReason::ProcessExited, |stop| stop.reason);
+    if session.data.lock().await.info.cleanup_error.is_some() {
+        tracing::info!(event = "session_cleanup_recovered", session_id = %session.id, project = %session.project, pid = session.pid.load(Ordering::Acquire), "Vivado cleanup recovered after an earlier failure");
+        session.telemetry.event("session_cleanup", "recovered");
+    }
     session.finish(reason, exit_code, truncated).await;
 }
 
@@ -432,7 +497,8 @@ async fn report_cleanup_error(manager: &Manager, session: &Session, error: Strin
     manager.degraded.store(true, Ordering::Release);
     let mut data = session.data.lock().await;
     if data.info.cleanup_error.is_none() {
-        tracing::error!(session_id = %data.info.session_id, %error, "Vivado cleanup is incomplete");
+        tracing::error!(event = "session_cleanup_failed", session_id = %session.id, project = %session.project, pid = session.pid.load(Ordering::Acquire), %error, "Vivado cleanup is incomplete");
+        session.telemetry.event("session_cleanup", "incomplete");
         data.info.cleanup_error = Some(error);
     }
     drop(data);

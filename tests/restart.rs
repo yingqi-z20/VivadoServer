@@ -344,3 +344,61 @@ async fn second_server_cannot_acquire_a_live_instances_workspace() {
     first.push(id, &[]).await;
     assert_eq!(first.info(id).await["status"], "preparing");
 }
+
+#[tokio::test]
+async fn default_json_logging_flushes_on_shutdown_and_archives_survive_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    let mut server = ProcessServer::spawn(temp.path(), &workspace);
+    server.ready().await;
+    let id = server.create(true).await;
+    server.push(id, &[]).await;
+    server.run_to_pull(id).await;
+    let info = server.info(id).await;
+    let session_id = info["session_id"].as_str().unwrap();
+    kill(Pid::from_raw(server.child.id() as i32), Signal::SIGTERM).unwrap();
+    assert!(server.wait_exit().await.success());
+
+    let logs = server.logs();
+    assert!(!logs.contains(TOKEN));
+    let events: Vec<Value> = logs
+        .lines()
+        .map(|line| {
+            serde_json::from_str(line)
+                .unwrap_or_else(|error| panic!("invalid JSON log: {error}: {line}"))
+        })
+        .collect();
+    assert!(
+        events
+            .iter()
+            .any(|event| event["fields"]["event"] == "service.stopped")
+    );
+    assert!(events.iter().any(|event| {
+        event["fields"]["event"] == "http_response_finished"
+            && event["fields"]["outcome"] == "complete"
+            && Uuid::parse_str(event["fields"]["request_id"].as_str().unwrap_or("")).is_ok()
+    }));
+    assert!(logs.contains(&id.to_string()));
+    assert!(logs.contains(session_id));
+
+    let archive = workspace
+        .join(".vivado-server/diagnostics")
+        .join(format!("{session_id}.jsonl"));
+    let original = fs::read(&archive).unwrap();
+    let records: Vec<Value> = String::from_utf8(original.clone())
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(records.last().unwrap()["event"], "finished");
+    assert_eq!(records.last().unwrap()["archive_truncated"], false);
+    assert!(records.iter().any(|record| {
+        record["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("final output before exit"))
+    }));
+
+    let mut restarted = ProcessServer::spawn(temp.path(), &workspace);
+    restarted.ready().await;
+    assert_eq!(fs::read(archive).unwrap(), original);
+}

@@ -43,6 +43,7 @@ pub struct AppConfig {
     pub json_deadline_secs: u64,
     pub shutdown_grace_secs: u64,
     pub max_in_flight_requests: usize,
+    pub observability: ObservabilityConfig,
     pub tls: Option<TlsConfig>,
 }
 
@@ -72,6 +73,7 @@ impl Default for AppConfig {
             json_deadline_secs: 120,
             shutdown_grace_secs: 15,
             max_in_flight_requests: 64,
+            observability: ObservabilityConfig::default(),
             tls: None,
         }
     }
@@ -117,7 +119,76 @@ pub struct RuntimeConfig {
     pub json_deadline_secs: u64,
     pub shutdown_grace_secs: u64,
     pub max_in_flight_requests: usize,
+    pub observability: ObservabilityConfig,
+    pub(crate) telemetry: crate::observability::Observability,
     pub tls: Option<TlsConfig>,
+}
+
+/// Diagnostic output format. JSON is suitable for journald and log collectors.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LogFormat {
+    Text,
+    #[default]
+    Json,
+}
+
+/// Bounded operational telemetry. Output archives contain trusted-client PTY output.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ObservabilityConfig {
+    pub log_format: LogFormat,
+    /// `RUST_LOG`, when set, takes precedence over this filter.
+    pub log_filter: String,
+    pub metrics_enabled: bool,
+    pub archive_output: bool,
+    pub archive_max_bytes_per_session: u64,
+    pub archive_max_total_bytes: u64,
+    pub archive_retention_secs: u64,
+    pub archive_max_sessions: usize,
+}
+
+impl Default for ObservabilityConfig {
+    fn default() -> Self {
+        Self {
+            log_format: LogFormat::Json,
+            log_filter: "vivado_server=info,tower_http=warn".into(),
+            metrics_enabled: true,
+            archive_output: true,
+            archive_max_bytes_per_session: 64 * 1024 * 1024,
+            archive_max_total_bytes: 512 * 1024 * 1024,
+            archive_retention_secs: 7 * 24 * 3600,
+            archive_max_sessions: 128,
+        }
+    }
+}
+
+impl ObservabilityConfig {
+    fn validate(&self) -> anyhow::Result<()> {
+        tracing_subscriber::EnvFilter::try_new(&self.log_filter)
+            .context("invalid observability.log_filter")?;
+        anyhow::ensure!(
+            !self.log_filter.trim().is_empty(),
+            "observability.log_filter cannot be empty"
+        );
+        anyhow::ensure!(
+            self.archive_max_bytes_per_session >= 4096,
+            "observability.archive_max_bytes_per_session must be at least 4096"
+        );
+        anyhow::ensure!(
+            self.archive_max_total_bytes >= self.archive_max_bytes_per_session,
+            "observability.archive_max_total_bytes must be at least archive_max_bytes_per_session"
+        );
+        anyhow::ensure!(
+            (1..=100_000).contains(&self.archive_max_sessions),
+            "observability.archive_max_sessions must be between 1 and 100000"
+        );
+        anyhow::ensure!(
+            (1..=315_360_000).contains(&self.archive_retention_secs),
+            "observability.archive_retention_secs must be between 1 and 315360000"
+        );
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -192,6 +263,8 @@ impl AppConfig {
             json_deadline_secs: self.json_deadline_secs,
             shutdown_grace_secs: self.shutdown_grace_secs,
             max_in_flight_requests: self.max_in_flight_requests,
+            observability: self.observability,
+            telemetry: crate::observability::Observability::new(),
             tls: self.tls,
         };
         Ok((runtime, auth))
@@ -210,6 +283,7 @@ impl AppConfig {
     }
 
     fn validate_settings(&mut self) -> anyhow::Result<()> {
+        self.observability.validate()?;
         let addr: SocketAddr = self
             .listen_addr
             .parse()
@@ -531,6 +605,27 @@ mod tests {
         assert!(validate_capacity("capacity", 101, 100).is_err());
         assert!(validate_duration("duration", 0).is_err());
         assert!(validate_duration("duration", u64::MAX).is_err());
+    }
+
+    #[test]
+    fn observability_settings_are_strict_and_bounded() {
+        let example = parse_config(include_str!("../config.example.toml")).unwrap();
+        assert!(example.observability.validate().is_ok());
+        assert_eq!(example.observability.log_format, LogFormat::Json);
+        assert!(parse_config("[observability]\nlog_format = 'xml'\n").is_err());
+        assert!(parse_config("[observability]\nunknown = true\n").is_err());
+        for bad in [
+            "archive_max_bytes_per_session = 0",
+            "archive_max_total_bytes = 4096",
+            "archive_max_sessions = 0",
+            "archive_retention_secs = 0",
+            "archive_retention_secs = 315360001",
+            "log_filter = ''",
+            "log_filter = 'vivado_server=invalid_level'",
+        ] {
+            let config = parse_config(&format!("[observability]\n{bad}\n")).unwrap();
+            assert!(config.observability.validate().is_err(), "accepted {bad}");
+        }
     }
 
     #[cfg(target_os = "linux")]

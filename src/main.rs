@@ -2,8 +2,7 @@ use anyhow::Context;
 use clap::Parser;
 use std::{future::Future, net::SocketAddr, path::PathBuf, time::Duration};
 use tokio::signal;
-use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
-use vivado_server::{AppConfig, AppRuntime};
+use vivado_server::{AppConfig, AppRuntime, initialize_logging};
 
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
@@ -14,17 +13,26 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::registry()
-        .with(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "vivado_server=info,tower_http=info".into()),
-        )
-        .with(tracing_subscriber::fmt::layer().with_target(true))
-        .init();
     let args = Args::parse();
     let config = AppConfig::from_file(&args.config).context("failed to load configuration")?;
-    let runtime = AppRuntime::initialize(config).await?;
+    let logging = initialize_logging(&config.observability)?;
+    tracing::info!(
+        event = "service.starting",
+        version = env!("CARGO_PKG_VERSION"),
+        "initializing Vivado service"
+    );
+    let runtime = match AppRuntime::initialize(config).await {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            tracing::error!(event = "service.start_failed", error = %format!("{error:#}"), "service initialization failed");
+            return Err(error);
+        }
+    };
+    runtime.observe_logging(&logging);
     let result = run(&runtime).await;
+    if let Err(error) = &result {
+        tracing::error!(event = "service.serve_failed", error = %format!("{error:#}"), "HTTP service stopped with an error");
+    }
     runtime.shutdown().await;
     result
 }
@@ -34,7 +42,7 @@ async fn run(runtime: &AppRuntime) -> anyhow::Result<()> {
     let addr: SocketAddr = config.listen_addr.parse()?;
     let app = runtime.router();
     let handle = axum_server::Handle::new();
-    tracing::info!(%addr, "starting Linux Vivado workflow server");
+    tracing::info!(event = "service.listening", %addr, tls = config.tls.is_some(), "starting Linux Vivado workflow server");
     if let Some(tls) = &config.tls {
         let tls =
             axum_server::tls_rustls::RustlsConfig::from_pem_file(&tls.cert_path, &tls.key_path)
@@ -76,7 +84,12 @@ async fn shutdown_signal() {
     let mut terminate = signal::unix::signal(signal::unix::SignalKind::terminate())
         .expect("install SIGTERM handler");
     tokio::select! {
-        result = signal::ctrl_c() => { if let Err(error) = result { tracing::error!(%error, "Ctrl+C handler failed"); } },
-        _ = terminate.recv() => {},
+        result = signal::ctrl_c() => {
+            if let Err(error) = result { tracing::error!(%error, "Ctrl+C handler failed"); }
+            tracing::info!(event = "service.signal", signal = "SIGINT", "shutdown requested");
+        },
+        _ = terminate.recv() => {
+            tracing::info!(event = "service.signal", signal = "SIGTERM", "shutdown requested");
+        },
     }
 }

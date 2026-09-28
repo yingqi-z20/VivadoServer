@@ -56,6 +56,22 @@ pub enum TerminationReason {
     WorkflowClosed,
 }
 
+impl TerminationReason {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::ProcessExited => "process_exited",
+            Self::ClientRequested => "client_requested",
+            Self::HeartbeatTimeout => "heartbeat_timeout",
+            Self::ServiceShutdown => "service_shutdown",
+            Self::OutputReadFailed => "output_read_failed",
+            Self::ProcessWaitFailed => "process_wait_failed",
+            Self::ProcessStartFailed => "process_start_failed",
+            Self::InputWriteFailed => "input_write_failed",
+            Self::WorkflowClosed => "workflow_closed",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct SessionInfo {
     pub session_id: Uuid,

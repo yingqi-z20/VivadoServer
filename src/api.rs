@@ -9,7 +9,7 @@ use crate::{
 use axum::{
     Json, Router,
     body::{Body, Bytes},
-    extract::{FromRequest, OriginalUri, Path, Query, Request, State},
+    extract::{FromRequest, MatchedPath, OriginalUri, Path, Query, Request, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -32,6 +32,10 @@ pub(crate) struct HealthResponse {
 #[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct ReadyResponse {
     pub status: &'static str,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub reasons: Vec<&'static str>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub failed_tasks: Vec<&'static str>,
 }
 #[derive(Clone)]
 struct ReadinessResponse;
@@ -160,15 +164,26 @@ pub(crate) fn build_router(services: AppServices) -> Router {
             services.auth.clone(),
             require_auth,
         ));
-    Router::new()
+    let metrics =
+        Router::new()
+            .route("/metrics", get(metrics))
+            .layer(middleware::from_fn_with_state(
+                services.auth.clone(),
+                require_auth,
+            ));
+    let telemetry = services.config.telemetry.clone();
+    let mut router = Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/openapi.json", get(openapi_json))
         .nest("/v1", protected)
-        .fallback(api_not_found)
+        .fallback(api_not_found);
+    if services.config.observability.metrics_enabled {
+        router = router.merge(metrics);
+    }
+    router
         .with_state(services)
-        .layer(tower_http::trace::TraceLayer::new_for_http())
-        .layer(middleware::from_fn(request_context))
+        .layer(middleware::from_fn_with_state(telemetry, request_context))
 }
 
 async fn admission(State(budget): State<HttpBudget>, mut request: Request, next: Next) -> Response {
@@ -198,11 +213,132 @@ async fn admission(State(budget): State<HttpBudget>, mut request: Request, next:
     Response::from_parts(parts, crate::body::hold(body, permit, cancel))
 }
 
-async fn request_context(request: Request, next: Next) -> Response {
+async fn request_context(
+    State(telemetry): State<crate::observability::Observability>,
+    request: Request,
+    next: Next,
+) -> Response {
     let request_id = Uuid::new_v4().to_string();
-    let span = tracing::debug_span!("request", request_id = %request_id);
-    let response = next.run(request).instrument(span).await;
-    normalize_response(response, &request_id).await
+    let method = match *request.method() {
+        Method::GET => "GET",
+        Method::HEAD => "HEAD",
+        Method::POST => "POST",
+        Method::PUT => "PUT",
+        Method::DELETE => "DELETE",
+        Method::PATCH => "PATCH",
+        Method::OPTIONS => "OPTIONS",
+        Method::TRACE => "TRACE",
+        Method::CONNECT => "CONNECT",
+        _ => "OTHER",
+    };
+    let route = metric_route(
+        request
+            .extensions()
+            .get::<MatchedPath>()
+            .map(MatchedPath::as_str),
+    );
+    let span = tracing::info_span!("request", request_id = %request_id, method, route,
+        workflow_id = tracing::field::Empty, sync_id = tracing::field::Empty);
+    if route.starts_with("/v1/workflows/{workflow_id}") {
+        let path = request
+            .extensions()
+            .get::<OriginalUri>()
+            .map(|uri| uri.0.path())
+            .unwrap_or(request.uri().path());
+        if let Some(id) = path
+            .split('/')
+            .nth(3)
+            .and_then(|value| Uuid::parse_str(value).ok())
+        {
+            span.record("workflow_id", tracing::field::display(id));
+        }
+        if route.contains("{sync_id}")
+            && let Some(id) = path
+                .split('/')
+                .nth(5)
+                .and_then(|value| Uuid::parse_str(value).ok())
+        {
+            span.record("sync_id", tracing::field::display(id));
+        }
+    }
+    let mut observation =
+        telemetry.request_started(method, route, request_id.clone(), span.clone());
+    let response = async {
+        let response = next.run(request).await;
+        normalize_response(response, &request_id).await
+    }
+    .instrument(span)
+    .await;
+    observation.headers(
+        response.status(),
+        response.extensions().get::<crate::error::ErrorDiagnostic>(),
+    );
+    let (mut parts, body) = response.into_parts();
+    let expected_length = parts
+        .headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok());
+    let body = if method == "HEAD" {
+        // Axum/Hyper suppress HEAD bodies; release body ownership without reporting
+        // a client abort or counting bytes that can never be sent.
+        if !parts.headers.contains_key(header::CONTENT_LENGTH)
+            && let Some(length) = http_body::Body::size_hint(&body).exact()
+        {
+            parts.headers.insert(
+                header::CONTENT_LENGTH,
+                HeaderValue::from_str(&length.to_string()).expect("integer header"),
+            );
+        }
+        observation.finish("complete");
+        Body::empty()
+    } else {
+        crate::body::observe(body, observation, expected_length)
+    };
+    Response::from_parts(parts, body)
+}
+
+fn metric_route(matched: Option<&str>) -> &'static str {
+    // An explicit allowlist keeps arbitrary paths and fallback paths out of logs
+    // and time-series labels, even if router nesting changes in the future.
+    match matched {
+        Some("/healthz") => "/healthz",
+        Some("/readyz") => "/readyz",
+        Some("/metrics") => "/metrics",
+        Some("/openapi.json") => "/openapi.json",
+        Some("/v1/workflows/{workflow_id}") => "/v1/workflows/{workflow_id}",
+        Some("/v1/workflows/{workflow_id}/heartbeat") => "/v1/workflows/{workflow_id}/heartbeat",
+        Some("/v1/workflows/{workflow_id}/finish") => "/v1/workflows/{workflow_id}/finish",
+        Some("/v1/workflows/{workflow_id}/session") => "/v1/workflows/{workflow_id}/session",
+        Some("/v1/workflows/{workflow_id}/session/stdin") => {
+            "/v1/workflows/{workflow_id}/session/stdin"
+        }
+        Some("/v1/workflows/{workflow_id}/session/output") => {
+            "/v1/workflows/{workflow_id}/session/output"
+        }
+        Some("/v1/workflows/{workflow_id}/sync/manifest") => {
+            "/v1/workflows/{workflow_id}/sync/manifest"
+        }
+        Some("/v1/workflows/{workflow_id}/sync/push/plan") => {
+            "/v1/workflows/{workflow_id}/sync/push/plan"
+        }
+        Some("/v1/workflows/{workflow_id}/sync/pull/plan") => {
+            "/v1/workflows/{workflow_id}/sync/pull/plan"
+        }
+        Some("/v1/workflows/{workflow_id}/sync/{sync_id}/files/{*path}") => {
+            "/v1/workflows/{workflow_id}/sync/{sync_id}/files/{path}"
+        }
+        Some("/v1/workflows/{workflow_id}/sync/{sync_id}/commit") => {
+            "/v1/workflows/{workflow_id}/sync/{sync_id}/commit"
+        }
+        Some("/v1/workflows/{workflow_id}/sync/{sync_id}") => {
+            "/v1/workflows/{workflow_id}/sync/{sync_id}"
+        }
+        Some("/v1/workflows/{workflow_id}/sync/files/{*path}") => {
+            "/v1/workflows/{workflow_id}/sync/files/{path}"
+        }
+        _ => "unmatched",
+    }
 }
 
 async fn normalize_response(response: Response, request_id: &str) -> Response {
@@ -215,6 +351,16 @@ async fn normalize_response(response: Response, request_id: &str) -> Response {
     }
     let status = response.status();
     let (mut parts, body) = response.into_parts();
+    if parts
+        .extensions
+        .get::<crate::error::ErrorDiagnostic>()
+        .is_none()
+    {
+        parts.extensions.insert(crate::error::ErrorDiagnostic {
+            code: default_error_code(status),
+            diagnostic: None,
+        });
+    }
     let bytes = axum::body::to_bytes(body, 16 * 1024)
         .await
         .unwrap_or_default();
@@ -313,7 +459,22 @@ async fn healthz() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
 }
 async fn readyz(State(services): State<AppServices>) -> Response {
-    let degraded = services.shutdown.is_cancelled() || services.workflows.is_degraded();
+    let mut reasons = Vec::new();
+    if services.shutdown.is_cancelled() {
+        reasons.push("shutting_down");
+    }
+    if services.workflows.is_degraded() {
+        reasons.push("workflow_cleanup_failed");
+    }
+    if !services.background_health.is_healthy() {
+        reasons.push("background_task_failed");
+    }
+    let degraded = !reasons.is_empty();
+    services.config.telemetry.set_ready(!degraded);
+    let diagnostic = degraded.then(|| crate::error::ErrorDiagnostic {
+        code: "service_not_ready",
+        diagnostic: Some(format!("readiness checks failed: {}", reasons.join(","))),
+    });
     let mut response = (
         if degraded {
             StatusCode::SERVICE_UNAVAILABLE
@@ -322,11 +483,39 @@ async fn readyz(State(services): State<AppServices>) -> Response {
         },
         Json(ReadyResponse {
             status: if degraded { "degraded" } else { "ready" },
+            reasons,
+            failed_tasks: services.background_health.failed_tasks(),
         }),
     )
         .into_response();
     response.extensions_mut().insert(ReadinessResponse);
+    if let Some(diagnostic) = diagnostic {
+        response.extensions_mut().insert(diagnostic);
+    }
     response
+}
+async fn metrics(State(services): State<AppServices>) -> Result<Response, AppError> {
+    services.config.telemetry.set_ready(
+        !services.shutdown.is_cancelled()
+            && !services.workflows.is_degraded()
+            && services.background_health.is_healthy(),
+    );
+    let rendered = services
+        .config
+        .telemetry
+        .render()
+        .map_err(|error| AppError::Internal(format!("failed to encode metrics: {error}")))?;
+    Ok((
+        [
+            (
+                header::CONTENT_TYPE,
+                "text/plain; version=0.0.4; charset=utf-8",
+            ),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        rendered,
+    )
+        .into_response())
 }
 async fn openapi_json() -> Json<serde_json::Value> {
     Json(crate::openapi::document())
@@ -502,6 +691,7 @@ async fn sync_abort(
 async fn sync_download_file(
     State(services): State<AppServices>,
     Path(path): Path<DownloadPath>,
+    method: Method,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
     let if_match = headers
@@ -513,8 +703,15 @@ async fn sync_download_file(
                 .map_err(|_| AppError::BadRequest("invalid If-Match".into()))
         })
         .transpose()?;
-    services
-        .workflows
-        .download(path.workflow_id, path.path, if_match)
-        .await
+    if method == Method::HEAD {
+        services
+            .workflows
+            .head_download(path.workflow_id, path.path, if_match)
+            .await
+    } else {
+        services
+            .workflows
+            .download(path.workflow_id, path.path, if_match)
+            .await
+    }
 }

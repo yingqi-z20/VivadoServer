@@ -36,12 +36,21 @@ cp config.example.toml config.toml
 ## 协议与恢复
 
 - 公开 `GET /healthz`、`GET /readyz`、`GET /openapi.json`；其余接口要求 `Authorization: Bearer <token>`。
+- 默认提供需认证的 `GET /metrics`，可在 `[observability]` 中关闭。`readyz` 在关闭、清理异常或关键后台任务意外退出时返回 503 和原因。
 - 输出游标有界，支持 `overrun` 和最终输出截断标记；停止期间有明确 `stopping` 状态。
 - 上传流式检查大小和 SHA-256，使用临时文件原子替换；下载通过 `If-Match`、ETag 和客户端最终校验确认内容。
 - clean/dirty 工程标记决定重启后能否复用。中断或不确定的工程通过可信客户端全量重传恢复，不自动猜测断电时的事务进度。
 - Linux 进程组 TERM/KILL、退出回收和 systemd `KillMode=control-group` 共同约束 Vivado 生命周期。
 
 客户端算法和示例见 [中文指南](docs/client-development.zh-CN.md) 或 [English guide](docs/client-development.md)。运行中服务的 `/openapi.json` 描述机器可读接口；并发与持久化边界见 [架构文档](docs/architecture.md)。
+
+## 日志与可观测性
+
+服务默认向 stdout 写 JSON 结构化日志，常规业务请求在 INFO 记录完成事件，并关联 `request_id`、workflow、session 和 sync 上下文。HTTP 响应头生成与响应体完成分开计量；中断下载不会计为完整传输。日志使用有界异步队列，丢弃量可通过指标查看。
+
+Vivado 的 PTY 输出默认归档到 `<workspace>/.vivado-server/diagnostics/<session_id>.jsonl`，采用有界异步写入，单会话最多 64 MiB、总计 512 MiB、保留 7 天且最多 128 个会话。归档与内存输出游标独立，可能截断，并不恢复重启前的 workflow API 状态。工具输出可能含敏感信息；不需要留存时设置 `archive_output=false`。
+
+排障查询、指标语义、归档完整性检查和告警接入见 [日志与可观测性指南](docs/observability.md)。仓库提供 [Prometheus 抓取配置](deploy/observability/prometheus.yml) 和 [告警规则](deploy/observability/alerts.yml)，需要运维自行部署监控服务。
 
 ## 验证
 

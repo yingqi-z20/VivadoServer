@@ -1,0 +1,102 @@
+# Starting thresholds: tune using real workload and expected request volume.
+# All selectors match the job_name in the adjacent prometheus.yml example.
+groups:
+  - name: vivado-server
+    rules:
+      - alert: VivadoServerScrapeFailed
+        expr: up{job="vivado-server"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: VivadoServer metrics scrape is failing
+          description: Check service availability, metrics_enabled, token access, and network/TLS configuration.
+
+      - alert: VivadoServerNotReady
+        expr: vivado_server_ready{job="vivado-server"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: VivadoServer is not ready
+          description: Inspect /readyz reasons and correlated workflow/session cleanup logs before restarting.
+
+      - alert: VivadoServerBackgroundTaskFailed
+        expr: sum by (job, instance, task) (vivado_server_background_task_failures_total{job="vivado-server"}) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: A supervised VivadoServer task failed
+          description: A failure occurred in this process lifetime. Inspect the task and panic/error logs; preserve diagnostics before recovery.
+
+      - alert: VivadoServerHttpErrors
+        expr: |
+          (
+            sum by (job, instance) (rate(vivado_server_http_requests_total{job="vivado-server",status=~"5..",route!~"/healthz|/readyz|/metrics|.*/session/output|.*/files/.*"}[5m]))
+            /
+            sum by (job, instance) (rate(vivado_server_http_requests_total{job="vivado-server",route!~"/healthz|/readyz|/metrics|.*/session/output|.*/files/.*"}[5m]))
+          ) > 0.05
+          and on (job, instance)
+          sum by (job, instance) (increase(vivado_server_http_requests_total{job="vivado-server",route!~"/healthz|/readyz|/metrics|.*/session/output|.*/files/.*"}[5m])) >= 20
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: VivadoServer ordinary HTTP 5xx rate is elevated
+          description: More than 5% errors with at least 20 requests per 5 minutes. Probes, long polls, and file transfers are excluded.
+
+      - alert: VivadoServerControlLatency
+        # Restrict to workflow status GET and heartbeat POST. Planning, commit,
+        # process startup, long polling, and uploads/downloads are not an SLO here.
+        expr: |
+          histogram_quantile(0.95,
+            sum by (job, instance, le) (
+              rate(vivado_server_http_request_duration_seconds_bucket{job="vivado-server",method=~"GET|POST",route=~"/v1/workflows/[^/]+(/heartbeat)?"}[5m])
+            )
+          ) > 5
+          and on (job, instance)
+          sum by (job, instance) (increase(vivado_server_http_request_duration_seconds_count{job="vivado-server",method=~"GET|POST",route=~"/v1/workflows/[^/]+(/heartbeat)?"}[5m])) >= 20
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: VivadoServer workflow status or heartbeat is slow
+          description: Response-header P95 exceeds 5 seconds with enough samples. Inspect saturation and cleanup activity.
+
+      - alert: VivadoServerResponseBodyFailed
+        expr: sum by (job, instance) (increase(vivado_server_http_responses_total{job="vivado-server",outcome="body_error"}[5m])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: VivadoServer response body failed after headers
+          description: Inspect correlated request and sync logs. A 200 header does not guarantee a complete download.
+
+      - alert: VivadoServerCleanupTrouble
+        expr: |
+          sum by (job, instance) (increase(vivado_server_events_total{job="vivado-server",kind=~"workflow_cleanup|session_cleanup|sync_cleanup",outcome=~"failed|incomplete|error"}[5m])) > 0
+          or
+          sum by (job, instance) (vivado_server_active{job="vivado-server",kind="sync_cleanup_pending"}) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: VivadoServer cleanup needs attention
+          description: Inspect cleanup retries, recovery events, and pending state. Never free ownership before process death is confirmed.
+
+      - alert: VivadoServerArchiveLoss
+        # Lifetime counters catch an initialization failure before the first scrape.
+        expr: sum by (job, instance) (vivado_server_events_total{job="vivado-server",kind="archive",outcome=~"queue_full|session_limit|total_limit|disk_error|worker_stopped|worker_panicked|drain_timeout|shutdown_timeout|initialization_failed|retention_failed"}) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: VivadoServer PTY archive has lost data or failed
+          description: Inspect archive_issues, footer presence, storage, and limits. This remains active for the process lifetime after any failure.
+
+      - alert: VivadoServerLogLoss
+        # This is a lifetime gauge, not a counter: do not use rate()/increase().
+        expr: vivado_server_log_dropped_messages{job="vivado-server"} > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: VivadoServer service logs have been dropped
+          description: The bounded stdout queue overflowed. Check the collector and log volume; the gauge resets when the process restarts.
